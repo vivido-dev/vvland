@@ -1,0 +1,11 @@
+[package]
+name = "vvland"
+version = "0.0.1"
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
+edition = "2024"
+description = "vvland"
+license = "Apache-2.0"
+readme = "README.md"
+#repository = "https://github.com/vivido-dev/vvland"
+
+[dependencies]
