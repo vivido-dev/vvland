@@ -1,11 +1,37 @@
 [package]
 name = "vvland"
-version = "0.0.1"
+version = "0.1.0"
 authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
 edition = "2024"
-description = "vvland"
+rust-version = "1.85.0"
+description = "Run one Wayland app or compositor inside Vivido over Vivid"
+repository = "https://github.com/vivido-dev/vvland"
 license = "Apache-2.0"
 readme = "README.md"
-#repository = "https://github.com/vivido-dev/vvland"
+build = "build.rs"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive", "env"] }
+base64 = "0.23"
+getrandom = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.11"
+zeroize = { version = "1.9", features = ["derive", "serde"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features = false, features = ["native-transport"] }
+
+[dev-dependencies]
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false, features = ["testing"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+crossterm = "0.29"
+ffmpeg-next = "8.1"
+pipewire = { version = "0.10", features = ["v0_3_44"] }
+signal-hook = "0.4"
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.9"
+vvreceive = { path = "../vvreceive" }

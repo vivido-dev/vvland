@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>vvland live-stream performance workload</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; }
+  canvas { width: 100%; height: 100%; display: block; }
+</style>
+<canvas id="frame" width="1920" height="1080"></canvas>
+<script>
+  const canvas = document.querySelector("#frame");
+  const context = canvas.getContext("2d", {alpha: false, desynchronized: true});
+  const started = performance.now();
+  let frames = 0;
+  let lastSecond = started;
+  let measuredFps = 0;
+
+  function draw(now) {
+    const seconds = (now - started) / 1000;
+    const stripe = Math.floor(seconds * 360) % canvas.width;
+    const hue = Math.floor(seconds * 90) % 360;
+    context.fillStyle = `hsl(${hue} 85% 42%)`;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    for (let x = -canvas.height; x < canvas.width + canvas.height; x += 96) {
+      context.fillStyle = ((x / 96) & 1) ? "#111" : "#eee";
+      context.beginPath();
+      context.moveTo((x + stripe) % (canvas.width + canvas.height) - canvas.height, 0);
+      context.lineTo((x + stripe + 64) % (canvas.width + canvas.height) - canvas.height, 0);
+      context.lineTo((x + stripe + canvas.height + 64) % (canvas.width + canvas.height), canvas.height);
+      context.lineTo((x + stripe + canvas.height) % (canvas.width + canvas.height), canvas.height);
+      context.fill();
+    }
+    context.fillStyle = "rgba(0, 0, 0, .82)";
+    context.fillRect(32, 32, 880, 190);
+    context.fillStyle = "white";
+    context.font = "64px monospace";
+    context.fillText(`source ${seconds.toFixed(3)} s`, 56, 112);
+    context.fillText(`render ${measuredFps.toFixed(1)} fps`, 56, 190);
+    frames += 1;
+    if (now - lastSecond >= 1000) {
+      measuredFps = frames * 1000 / (now - lastSecond);
+      frames = 0;
+      lastSecond = now;
+    }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  // Start deterministic local audio after the first user gesture. Chrome's autoplay policy
+  // deliberately applies, so click once after loading exactly as a user starts a YouTube video.
+  addEventListener("click", () => {
+    if (window.audioContext) return;
+    window.audioContext = new AudioContext({sampleRate: 48000, latencyHint: "interactive"});
+    const oscillator = new OscillatorNode(audioContext, {frequency: 440});
+    const gain = new GainNode(audioContext, {gain: 0.08});
+    oscillator.connect(gain).connect(audioContext.destination);
+    oscillator.start();
+  }, {once: true});
+</script>
