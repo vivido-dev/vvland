@@ -522,7 +522,7 @@ fn run_desktop(
     }
     let _ = compositor_session.input_mut().release_all();
     if let Some(file_drops) = &mut file_drops {
-        let mut desktop_session = lock(&desktop);
+        let desktop_session = lock(&desktop);
         if let Ok(binding) = file_drops.binding.disable() {
             let _ = desktop_session
                 .session()
