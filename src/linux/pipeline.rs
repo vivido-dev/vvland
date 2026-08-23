@@ -63,7 +63,7 @@ const SLOT_MILESTONE: u64 = 1 << 4;
 enum WorkerNotice {
     Fatal(String),
     AudioLost(String),
-    FileDropCommitted(vvreceive::CommittedFileDrop),
+    FileDropCommitted(Box<vvreceive::CommittedFileDrop>),
 }
 
 struct DesktopDropRuntime {
@@ -839,7 +839,7 @@ fn session_loop_desktop(
                     }
                     audio.disable(&error);
                 }
-                WorkerNotice::FileDropCommitted(committed) => committed_drops.push(committed),
+                WorkerNotice::FileDropCommitted(committed) => committed_drops.push(*committed),
             }
         }
         if let Some(status) = compositor_session.try_wait()? {
@@ -923,8 +923,8 @@ fn session_loop_desktop(
                                 if let Ok(committed) =
                                     vvreceive::receive_accepted(channel, offer, directory)
                                 {
-                                    let _ =
-                                        completion.send(WorkerNotice::FileDropCommitted(committed));
+                                    let _ = completion
+                                        .send(WorkerNotice::FileDropCommitted(Box::new(committed)));
                                 }
                             })?;
                     }
