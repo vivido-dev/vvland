@@ -20,10 +20,14 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 zeroize = { version = "1.9", features = ["derive", "serde"] }
 vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false }
-vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features = false, features = ["native-transport"] }
+vivid_protocol = { version = "1.5", path = "../vivid_protocol", default-features = false, features = [
+  "native-transport",
+] }
 
 [dev-dependencies]
-vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false, features = ["testing"] }
+vivid_sdk = { version = "1.5", path = "../vivid_sdk", default-features = false, features = [
+  "testing",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 crossterm = "0.29"
@@ -34,4 +38,4 @@ wayland-client = "0.31"
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 xkbcommon = "0.9"
-vvreceive = { path = "../vvreceive" }
+vvreceive = { version = "0.1", path = "../vvreceive" }
