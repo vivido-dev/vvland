@@ -1392,6 +1392,7 @@ fn video_track_config(
         .checked_mul(u64::from(dimensions.1))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "coded pixels overflow"))?;
     let mut cfg = TrackConfiguration {
+        direction: Default::default(),
         context_id: session.info().root_context_id,
         surface_id: 0, // filled by the caller
         track_id: 0,   // filled by the caller
@@ -1439,6 +1440,7 @@ fn audio_track_config(
     spec: &super::audio::AudioTrackSpec,
 ) -> TrackConfiguration {
     let mut cfg = TrackConfiguration {
+        direction: Default::default(),
         context_id: session.info().root_context_id,
         surface_id: 0, // filled by the caller
         track_id: 0,   // filled by the caller
@@ -3276,6 +3278,7 @@ mod tests {
         contract.set(Resource::EncodedBitsPerSecond, 4_000_000);
         contract.set(Resource::MediaRecordBody, 65536);
         let mut cfg = TrackConfiguration {
+            direction: Default::default(),
             context_id: 1,
             surface_id: 1,
             track_id: 1,
