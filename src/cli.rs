@@ -777,6 +777,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn unknown_app_profiles_are_rejected_and_known_ones_accepted() {
         let mut config = base();
         config.doctor = true;
@@ -893,6 +894,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn renderer_maps_to_each_compositors_own_name() {
         assert_eq!(Renderer::Gl.as_weston(), "gl");
         assert_eq!(Renderer::Auto.as_weston(), "auto");

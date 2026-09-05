@@ -1,4 +1,5 @@
 //! Live end-to-end tests for the headless control surface (headless-plan §7.4, §7.2.3/4/6).
+#![cfg(target_os = "linux")]
 //!
 //! These tests drive the real `vvland` binary over `serve` / `msg` / `kill-session` — no fakes,
 //! no mocks, no log scraping. They are opt-in:
