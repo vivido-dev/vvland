@@ -64,6 +64,7 @@ enum WorkerNotice {
     Fatal(String),
     AudioLost(String),
     FileDropCommitted(Box<vvreceive::CommittedFileDrop>),
+    FileDropFailed(vivid_protocol::file_drop::FileDropTuple),
 }
 
 struct DesktopDropRuntime {
@@ -825,11 +826,12 @@ fn session_loop_desktop(
     file_drops: &mut Option<DesktopDropRuntime>,
 ) -> io::Result<()> {
     let mut last_reported_rejections = 0_u64;
+    let mut pending_drops = Vec::new();
     loop {
         if terminated.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut committed_drops = Vec::new();
+        let mut failed_drops = Vec::new();
         while let Ok(notice) = notices.try_recv() {
             match notice {
                 WorkerNotice::Fatal(error) => return Err(io::Error::other(error)),
@@ -839,7 +841,10 @@ fn session_loop_desktop(
                     }
                     audio.disable(&error);
                 }
-                WorkerNotice::FileDropCommitted(committed) => committed_drops.push(*committed),
+                WorkerNotice::FileDropCommitted(committed) => {
+                    pending_drops.push((Instant::now(), *committed))
+                }
+                WorkerNotice::FileDropFailed(binding) => failed_drops.push(binding),
             }
         }
         if let Some(status) = compositor_session.try_wait()? {
@@ -851,9 +856,17 @@ fn session_loop_desktop(
         compositor_session.input_mut().check_status()?;
 
         let mut desktop_session = lock(desktop);
-        for committed in committed_drops {
-            vvreceive::reconcile_committed(desktop_session.session(), committed)?;
+        for binding in failed_drops {
+            let _ = desktop_session.session().cancel_file_drop(
+                vivid_sdk::CancelFileDrop { binding, reason: 0 },
+                &RequestMetadata::default(),
+            );
         }
+        pending_drops.retain_mut(|(started, committed)| {
+            started.elapsed() < Duration::from_secs(60)
+                && vvreceive::reconcile_committed_pending(desktop_session.session(), committed)
+                    .is_err()
+        });
         // Session control events: the desktop surface is producer-defined on a fixed headless
         // output, so only target and connection changes matter; flow (b) geometry changes do
         // not apply here.
@@ -880,6 +893,16 @@ fn session_loop_desktop(
                     ));
                 }
                 SessionEvent::FileDropOffered(offer) => {
+                    if pending_drops.len() >= 4 {
+                        let _ = desktop_session.session().cancel_file_drop(
+                            vivid_sdk::CancelFileDrop {
+                                binding: offer.binding,
+                                reason: 0,
+                            },
+                            &RequestMetadata::default(),
+                        );
+                        continue;
+                    }
                     if let Some(runtime) = file_drops.as_ref() {
                         let transfer_id = desktop_session.session().allocate_id()?;
                         let maximum_record_body = runtime
@@ -920,12 +943,15 @@ fn session_loop_desktop(
                         thread::Builder::new()
                             .name("vvland-file-drop".into())
                             .spawn(move || {
-                                if let Ok(committed) =
-                                    vvreceive::receive_accepted(channel, offer, directory)
-                                {
-                                    let _ = completion
-                                        .send(WorkerNotice::FileDropCommitted(Box::new(committed)));
-                                }
+                                let binding = offer.binding;
+                                let notice =
+                                    match vvreceive::receive_accepted(channel, offer, directory) {
+                                        Ok(committed) => {
+                                            WorkerNotice::FileDropCommitted(Box::new(committed))
+                                        }
+                                        Err(_) => WorkerNotice::FileDropFailed(binding),
+                                    };
+                                let _ = completion.send(notice);
                             })?;
                     }
                 }
@@ -1101,7 +1127,7 @@ fn session_loop_terminal(
                     }
                     audio.disable(&error);
                 }
-                WorkerNotice::FileDropCommitted(_) => {}
+                WorkerNotice::FileDropCommitted(_) | WorkerNotice::FileDropFailed(_) => {}
             }
         }
         if let Some(status) = compositor_session.try_wait()? {
@@ -2871,7 +2897,7 @@ fn drain_notices(
                 return Err(io::Error::other(error));
             }
             WorkerNotice::AudioLost(error) => audio.disable(&error),
-            WorkerNotice::FileDropCommitted(_) => {}
+            WorkerNotice::FileDropCommitted(_) | WorkerNotice::FileDropFailed(_) => {}
         }
     }
     Ok(())
