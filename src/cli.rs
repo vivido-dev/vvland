@@ -12,9 +12,19 @@ pub enum CompositorChoice {
     Auto,
     Weston,
     Sway,
+    Hyprland,
 }
 
-/// Weston's output backend. Sway is headless-only, so this is Weston-only (plan D11).
+impl CompositorChoice {
+    /// Whether this choice names a compositor that is always headless, so the Weston-only DRM
+    /// flags and Weston's renderer name are mistakes rather than preferences.
+    fn is_wlroots(self) -> bool {
+        matches!(self, Self::Sway | Self::Hyprland)
+    }
+}
+
+/// Weston's output backend. Sway and Hyprland are headless-only, so this is Weston-only
+/// (plan D11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Backend {
     Auto,
@@ -22,11 +32,12 @@ pub enum Backend {
     Headless,
 }
 
-/// The union of both compositors' renderer names.
+/// The union of the compositors' renderer names.
 ///
 /// `gl` is Weston's name and `gles2` is wlroots'; each is rejected for the other compositor when
 /// the compositor was named explicitly, and degrades to automatic selection under
-/// `--compositor auto` (plan D11).
+/// `--compositor auto` (plan D11). Hyprland renders through aquamarine and offers no choice at
+/// all, so any explicit renderer is rejected for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Renderer {
     Auto,
@@ -431,9 +442,9 @@ fn parse_control_duration(value: &str) -> Result<u64, String> {
     name = "vvland",
     version,
     about = "Run one Wayland app or compositor inside Vivido over Vivid",
-    long_about = "Start an isolated Weston or Sway desktop on Linux, capture it, encode \
-                  H.264/Opus, and stream it through the private Vivid endpoint inherited from \
-                  Vivido or vvssh."
+    long_about = "Start an isolated Weston, Sway, or Hyprland desktop on Linux, capture it, \
+                  encode H.264/Opus, and stream it through the private Vivid endpoint inherited \
+                  from Vivido or vvssh."
 )]
 pub struct Config {
     #[command(subcommand)]
@@ -469,6 +480,9 @@ pub struct Config {
 
     #[arg(long, default_value = "sway")]
     pub sway: PathBuf,
+
+    #[arg(long, default_value = "Hyprland")]
+    pub hyprland: PathBuf,
 
     #[arg(long)]
     pub drm_device: Option<PathBuf>,
@@ -684,19 +698,25 @@ impl Config {
                 "--renderer=gles2 is wlroots' name for the GLES renderer; Weston uses gl",
             ));
         }
-        if self.compositor != CompositorChoice::Sway {
+        if !self.compositor.is_wlroots() {
             return Ok(());
         }
         if self.backend != Backend::Auto {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--backend applies only to Weston; Sway is always headless",
+                "--backend applies only to Weston; Sway and Hyprland are always headless",
             ));
         }
         if self.drm_device.is_some() || self.drm_output.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "--drm-device and --drm-output apply only to Weston",
+            ));
+        }
+        if self.compositor == CompositorChoice::Hyprland && self.renderer != Renderer::Auto {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--renderer applies only to Weston and Sway; Hyprland renders through aquamarine",
             ));
         }
         if self.renderer == Renderer::Gl {
@@ -737,6 +757,7 @@ pub(crate) mod tests {
             backend: Backend::Auto,
             weston: "weston".into(),
             sway: "sway".into(),
+            hyprland: "Hyprland".into(),
             drm_device: None,
             drm_output: None,
             renderer: Renderer::Auto,
@@ -813,9 +834,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn weston_only_flags_are_rejected_for_sway() {
-        // Sway is headless-only and has no DRM leg; naming both is a mistake, not a preference.
+    fn weston_only_flags_are_rejected_for_the_headless_compositors() {
+        // Sway and Hyprland are headless-only and have no DRM leg; naming both is a mistake, not
+        // a preference.
         for arguments in [
+            vec![
+                "vvland",
+                "--doctor",
+                "--compositor=hyprland",
+                "--backend=drm",
+            ],
+            vec![
+                "vvland",
+                "--doctor",
+                "--compositor=hyprland",
+                "--drm-output=HDMI-A-1",
+            ],
+            vec![
+                "vvland",
+                "--doctor",
+                "--compositor=hyprland",
+                "--renderer=gles2",
+            ],
             vec!["vvland", "--doctor", "--compositor=sway", "--backend=drm"],
             vec![
                 "vvland",

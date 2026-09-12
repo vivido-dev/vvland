@@ -17,8 +17,8 @@ use crate::linux::launcher::{
     startup_error, terminate_group, write_private_file, xwayland_enabled,
 };
 
-use super::sway_input::InputChannel;
-use super::{AppWindow, CompositorEnvironment};
+use super::wlr_input::InputChannel;
+use super::{AppWindow, CompositorEnvironment, CompositorWindow, WindowRect};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_LAUNCHERS: u32 = 4096;
@@ -48,26 +48,6 @@ pub struct SwaySession {
     wayland_socket: PathBuf,
     launcher_sequence: u32,
     log_thread: Option<thread::JoinHandle<()>>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
-pub struct SwayRect {
-    pub x: i64,
-    pub y: i64,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
-pub struct SwayWindow {
-    pub id: u64,
-    pub title: Option<String>,
-    pub app_id: Option<String>,
-    pub xwayland_class: Option<String>,
-    pub pid: Option<u32>,
-    pub rect: SwayRect,
-    pub focused: bool,
-    pub fullscreen: bool,
 }
 
 impl SwaySession {
@@ -169,6 +149,7 @@ impl SwaySession {
         };
         let input = match InputChannel::connect(
             &wayland_socket,
+            "Sway",
             environment.width,
             environment.height,
             config.xkb_model.as_deref(),
@@ -564,7 +545,7 @@ fn sway_message(socket: &Path, kind: u32, payload: &[u8]) -> io::Result<Vec<u8>>
     Ok(reply)
 }
 
-pub fn query_windows(socket: &Path) -> io::Result<Vec<SwayWindow>> {
+pub fn query_windows(socket: &Path) -> io::Result<Vec<CompositorWindow>> {
     let reply = sway_message(socket, SWAY_IPC_GET_TREE, b"")?;
     let tree: serde_json::Value = serde_json::from_slice(&reply)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -576,7 +557,7 @@ pub fn query_windows(socket: &Path) -> io::Result<Vec<SwayWindow>> {
 fn collect_windows(
     node: &serde_json::Value,
     depth: usize,
-    windows: &mut Vec<SwayWindow>,
+    windows: &mut Vec<CompositorWindow>,
 ) -> io::Result<()> {
     if depth > MAX_TREE_DEPTH {
         return Err(io::Error::new(
@@ -625,13 +606,13 @@ fn collect_windows(
         let width = required_u32(rect, "width")?;
         let height = required_u32(rect, "height")?;
         let title = optional_string(node, "name")?;
-        windows.push(SwayWindow {
+        windows.push(CompositorWindow {
             id,
             title,
             app_id,
             xwayland_class,
             pid,
-            rect: SwayRect {
+            rect: WindowRect {
                 x,
                 y,
                 width,

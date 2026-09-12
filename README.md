@@ -2,14 +2,16 @@
 
 Run, stream, or automate one isolated Wayland app or compositor.
 
-`vvland` starts a host-supplied Wayland compositor (Weston or Sway), captures its output,
+`vvland` starts a host-supplied Wayland compositor (Weston, Sway, or Hyprland), captures its
+output,
 encodes H.264/Opus, and streams the session through the private Vivid endpoint inherited
 from Vivido or `vvssh`. It can also keep the desktop in an owner-only headless daemon and drive it
 through the local `vvland msg` protocol without a presenter or Vivid credentials.
 
 ```sh
-vvland --doctor                      # check the host (both compositors)
+vvland --doctor                      # check the host (every compositor)
 vvland --compositor sway             # stream an isolated Sway desktop
+vvland --compositor hyprland         # stream an isolated Hyprland desktop
 vvland --app thunar                  # run one application, alone, full-output
 vvland --app google-chrome -- --user-data-dir=/tmp/x
 vvland serve --session work          # start a detached headless desktop
@@ -18,8 +20,11 @@ vvland msg -t work inspect           # inspect and automate it
 vvland msg -t work screenshot > shot.png
 ```
 
-`--compositor auto|weston|sway` selects the session; `--app google-chrome|thunar` starts a
-headless compositor running exactly one application.
+`--compositor auto|weston|sway|hyprland` selects the session; `--app google-chrome|thunar` starts a
+headless compositor running exactly one application. Hyprland has no standalone headless backend,
+so it disables every physical connector and streams a headless output it creates for itself; that
+needs a GPU no other compositor is holding, which `vvland --compositor hyprland --doctor` verifies
+by starting a real session.
 
 In session mode, `C-b d` detaches while leaving the desktop alive, `C-b q` shuts the daemon down,
 and `SIGINT`, `SIGHUP`, or `SIGTERM` detach. A later `vvland --session work` reconnects without
@@ -46,6 +51,7 @@ Compositor:
 
     vvland --compositor weston
     vvland --compositor sway -- weston-simple-egl
+    vvland --compositor hyprland -- foot
 
 Compositor with app:
 

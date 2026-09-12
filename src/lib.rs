@@ -2,7 +2,8 @@
 //!
 //! The binary is a two-line call into [`main_entry`]. The same entry point is what the
 //! deprecated `veston` and `vvsway` wrappers call, each prepending its own `--compositor`
-//! argument so an old command line keeps its old behavior.
+//! argument so an old command line keeps its old behavior. Hyprland is reachable only through
+//! `--compositor hyprland`; it postdates the wrappers and has none of its own.
 
 pub mod cli;
 #[cfg(unix)]

@@ -1,3 +1,9 @@
+//! wlroots screencopy capture, shared by every compositor that advertises
+//! `zwlr_screencopy_manager_v1` — currently Sway and Hyprland.
+//!
+//! The compositor name is carried only for diagnostics: the protocol exchange itself is
+//! identical, so one worker serves both.
+
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
@@ -33,6 +39,7 @@ pub struct ScreencopyCapture {
 impl ScreencopyCapture {
     pub fn start(
         socket: &Path,
+        compositor: &'static str,
         width: u32,
         height: u32,
         fps: u32,
@@ -52,6 +59,7 @@ impl ScreencopyCapture {
                 let mut ready = Some(ready_tx);
                 let outcome = capture_loop(
                     stream,
+                    compositor,
                     width,
                     height,
                     fps,
@@ -91,7 +99,7 @@ impl ScreencopyCapture {
                 let _ = thread.join();
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "Sway did not produce an initial screencopy frame",
+                    format!("{compositor} did not produce an initial screencopy frame"),
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -100,7 +108,7 @@ impl ScreencopyCapture {
                 let _ = thread.join();
                 Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "Sway screencopy worker exited before its first frame",
+                    format!("{compositor} screencopy worker exited before its first frame"),
                 ))
             }
         }
@@ -144,6 +152,7 @@ struct FrameState {
 }
 
 struct CaptureState {
+    compositor: &'static str,
     shm: wl_shm::WlShm,
     mapped: Option<MappedBuffer>,
     frame: FrameState,
@@ -163,17 +172,18 @@ impl CaptureState {
         frame: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
         qh: &QueueHandle<Self>,
     ) -> io::Result<()> {
+        let compositor = self.compositor;
         let info = self.frame.info.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Sway screencopy did not offer a wl_shm buffer",
+                format!("{compositor} screencopy did not offer a wl_shm buffer"),
             )
         })?;
         if let Some(mapped) = &self.mapped {
             if mapped.info != info {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Sway changed screencopy buffer geometry or format",
+                    format!("{compositor} changed screencopy buffer geometry or format"),
                 ));
             }
         } else {
@@ -243,14 +253,20 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                         && info.height == state.expected_height =>
                 {
                     if state.frame.info.replace(info).is_some() {
-                        state.frame.failed =
-                            Some("Sway sent more than one wl_shm screencopy format".into());
+                        state.frame.failed = Some(format!(
+                            "{} sent more than one wl_shm screencopy format",
+                            state.compositor
+                        ));
                     }
                 }
                 Ok(info) => {
                     state.frame.failed = Some(format!(
-                        "Sway offered {}x{} screencopy for the expected {}x{} output",
-                        info.width, info.height, state.expected_width, state.expected_height
+                        "{} offered {}x{} screencopy for the expected {}x{} output",
+                        state.compositor,
+                        info.width,
+                        info.height,
+                        state.expected_width,
+                        state.expected_height
                     ));
                 }
                 Err(error) => state.frame.failed = Some(error.to_string()),
@@ -268,7 +284,9 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                 };
             }
             Event::Ready { .. } => state.frame.ready = true,
-            Event::Failed => state.frame.failed = Some("Sway screencopy frame failed".into()),
+            Event::Failed => {
+                state.frame.failed = Some(format!("{} screencopy frame failed", state.compositor));
+            }
             Event::Damage { .. } | Event::LinuxDmabuf { .. } => {}
             _ => {}
         }
@@ -284,6 +302,7 @@ delegate_noop!(CaptureState: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyMa
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     stream: UnixStream,
+    compositor: &'static str,
     width: u32,
     height: u32,
     fps: u32,
@@ -304,7 +323,7 @@ fn capture_loop(
         .clone_list()
         .into_iter()
         .find(|global| global.interface == wl_output::WlOutput::interface().name)
-        .ok_or_else(|| missing_global("wl_output"))?;
+        .ok_or_else(|| missing_global(compositor, "wl_output"))?;
     let output: wl_output::WlOutput = globals.registry().bind(
         output_global.name,
         output_global
@@ -314,6 +333,7 @@ fn capture_loop(
         (),
     );
     let mut state = CaptureState {
+        compositor,
         shm,
         mapped: None,
         frame: FrameState::default(),
@@ -335,7 +355,7 @@ fn capture_loop(
                 return Ok(());
             }
         }
-        if let Err(error) = validate_frame_completion(&state.frame) {
+        if let Err(error) = validate_frame_completion(compositor, &state.frame) {
             frame.destroy();
             return Err(error);
         }
@@ -436,7 +456,7 @@ fn validate_dimensions(width: u32, height: u32, fps: u32) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "invalid Sway capture dimensions or frame rate",
+            "invalid screencopy capture dimensions or frame rate",
         ));
     }
     Ok(())
@@ -450,14 +470,14 @@ fn frame_limit_delay(frame_period: Duration, elapsed: Duration) -> Duration {
     frame_period.saturating_sub(elapsed)
 }
 
-fn validate_frame_completion(frame: &FrameState) -> io::Result<()> {
+fn validate_frame_completion(compositor: &str, frame: &FrameState) -> io::Result<()> {
     if let Some(error) = &frame.failed {
         return Err(io::Error::new(io::ErrorKind::InvalidData, error.clone()));
     }
     if !frame.ready || !frame.buffer_done || !frame.copied {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Sway completed screencopy without buffer negotiation",
+            format!("{compositor} completed screencopy without buffer negotiation"),
         ));
     }
     Ok(())
@@ -487,7 +507,7 @@ fn buffer_info(
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("unsupported Sway wl_shm format {format:?}"),
+                format!("unsupported screencopy wl_shm format {format:?}"),
             ));
         }
     };
@@ -568,10 +588,10 @@ fn anonymous_file() -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn missing_global(name: &str) -> io::Error {
+fn missing_global(compositor: &str, name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        format!("Sway does not advertise required Wayland global {name}"),
+        format!("{compositor} does not advertise required Wayland global {name}"),
     )
 }
 
@@ -654,14 +674,17 @@ mod tests {
 
     #[test]
     fn capture_failure_is_terminal_for_the_current_frame() {
-        assert!(validate_frame_completion(&FrameState::default()).is_err());
+        assert!(validate_frame_completion("Sway", &FrameState::default()).is_err());
         assert!(
-            validate_frame_completion(&FrameState {
-                ready: true,
-                buffer_done: true,
-                copied: true,
-                ..FrameState::default()
-            })
+            validate_frame_completion(
+                "Sway",
+                &FrameState {
+                    ready: true,
+                    buffer_done: true,
+                    copied: true,
+                    ..FrameState::default()
+                }
+            )
             .is_ok()
         );
         let failed = FrameState {
@@ -669,7 +692,9 @@ mod tests {
             ..FrameState::default()
         };
         assert_eq!(
-            validate_frame_completion(&failed).unwrap_err().to_string(),
+            validate_frame_completion("Hyprland", &failed)
+                .unwrap_err()
+                .to_string(),
             "capture failed"
         );
     }

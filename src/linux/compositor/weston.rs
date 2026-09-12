@@ -12,8 +12,8 @@ use crate::cli::{Backend, Config, Renderer};
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
     RuntimeDirectory, child_output, confirm_started, pipe, sanitize_child_environment,
-    set_pulse_environment, socketpair, start_bounded_log, startup_error, terminate_group,
-    write_private_file, xwayland_enabled,
+    set_client_environment, set_pulse_environment, socketpair, start_bounded_log, startup_error,
+    terminate_group, write_private_file, xwayland_enabled,
 };
 
 use super::CompositorEnvironment;
@@ -22,7 +22,8 @@ use super::weston_input::InputChannel;
 /// The libweston input module, embedded at build time.
 ///
 /// Absent when the host had no libweston-13..16 development files (plan D12); the Weston backend
-/// then refuses to start and `--doctor` reports the gap, while `--compositor sway` is unaffected.
+/// then refuses to start and `--doctor` reports the gap, while the wlroots-protocol compositors
+/// are unaffected.
 #[cfg(not(no_weston_input))]
 const INPUT_MODULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libveston-input.so"));
 
@@ -573,19 +574,6 @@ fn set_runtime_environment(
     if let Some(pipewire_runtime) = pipewire_runtime {
         command.env("PIPEWIRE_RUNTIME_DIR", pipewire_runtime);
     }
-}
-
-fn set_client_environment(
-    command: &mut Command,
-    weston_runtime: &Path,
-    wayland_display: &str,
-    pulse_server: Option<&OsStr>,
-    pulse_sink: Option<&OsStr>,
-) {
-    command
-        .env("XDG_RUNTIME_DIR", weston_runtime)
-        .env("WAYLAND_DISPLAY", wayland_display);
-    set_pulse_environment(command, pulse_server, pulse_sink);
 }
 
 fn weston_startup_error(backend: ActiveBackend, error: &io::Error, log_path: &Path) -> io::Error {

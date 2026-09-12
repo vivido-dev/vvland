@@ -16,7 +16,7 @@ use crate::cli::{Backend, CompositorChoice, Config, Renderer};
 
 use super::audio::{AudioPipeline, PulseSink, idle_monitor_produces_data, resolve_pulse_server};
 use super::compositor::{
-    CompositorEnvironment, ResolvedCompositor, capture::ScreencopyCapture, sway, weston,
+    CompositorEnvironment, ResolvedCompositor, capture::ScreencopyCapture, hyprland, sway, weston,
 };
 use super::video::{CaptureSource, H264Encoder};
 
@@ -31,6 +31,10 @@ pub fn run(config: &Config) -> io::Result<()> {
     let sway_section = matches!(
         config.compositor,
         CompositorChoice::Auto | CompositorChoice::Sway
+    );
+    let hyprland_section = matches!(
+        config.compositor,
+        CompositorChoice::Auto | CompositorChoice::Hyprland
     );
     // Under `auto` neither compositor is required: only a host with no usable compositor at all
     // is a failure. Under an explicit choice, that compositor's section is mandatory.
@@ -54,6 +58,15 @@ pub fn run(config: &Config) -> io::Result<()> {
             compositor_failures.push(("sway", section));
         }
     }
+    if hyprland_section {
+        let mut section = Vec::new();
+        check_hyprland(config, &mut section);
+        if config.compositor == CompositorChoice::Hyprland {
+            failures.append(&mut section);
+        } else {
+            compositor_failures.push(("hyprland", section));
+        }
+    }
     if config.compositor == CompositorChoice::Auto {
         let usable = compositor_failures
             .iter()
@@ -74,7 +87,7 @@ pub fn run(config: &Config) -> io::Result<()> {
 
     // Only the packages every path needs. A compositor's own libraries belong to its section:
     // a Sway-only host has no reason to carry libpipewire, and a Weston-only host none to carry
-    // wayland-client, exactly as the two pre-consolidation doctors reported it.
+    // wayland-client, exactly as the pre-consolidation doctors reported it.
     for package in [
         "xkbcommon",
         "libavcodec",
@@ -126,7 +139,8 @@ pub fn run(config: &Config) -> io::Result<()> {
     }
 
     if weston_section {
-        // Only Weston's capture path goes through PipeWire; Sway uses wlroots screencopy.
+        // Only Weston's capture path goes through PipeWire; Sway and Hyprland use wlroots
+        // screencopy.
         match require_pipewire_server() {
             Ok(()) => println!("  ok       PipeWire server is reachable"),
             Err(error) if config.compositor == CompositorChoice::Weston => {
@@ -234,32 +248,89 @@ fn check_sway(config: &Config, failures: &mut Vec<String>) {
 }
 
 fn check_sway_protocols(config: &Config) -> io::Result<()> {
-    let width = config.width.unwrap_or(640) & !1;
-    let height = config.height.unwrap_or(360) & !1;
-    let session = sway::SwaySession::start(
-        config,
-        CompositorEnvironment {
-            width,
-            height,
-            pulse_server: None,
-            pulse_sink: None,
-            app_window: None,
-        },
-    )?;
+    let (width, height) = probe_size(config);
+    let session = sway::SwaySession::start(config, probe_environment(width, height))?;
+    probe_capture(session.wayland_socket(), "Sway", config, width, height)?;
+    drop(session);
+    Ok(())
+}
+
+/// The Hyprland section: binary version plus a live screencopy/virtual-device probe.
+///
+/// The probe is what makes this section worth running: Hyprland has no standalone headless
+/// backend, so whether a host can start one at all is only answered by starting one.
+fn check_hyprland(config: &Config, failures: &mut Vec<String>) {
+    check_package("wayland-client", failures);
+    match hyprland::hyprland_version(&config.hyprland) {
+        Ok(version) if hyprland::hyprland_supported(&version) => {
+            println!("  ok       Hyprland: {version}")
+        }
+        Ok(version) => failures.push(format!(
+            "Hyprland 0.53 or newer is required; found {}",
+            version.trim()
+        )),
+        Err(error) => failures.push(format!("could not execute Hyprland: {error}")),
+    }
+    if failures.is_empty() {
+        match check_hyprland_protocols(config) {
+            Ok(()) => println!(
+                "  ok       isolated Hyprland, headless output, screencopy, virtual keyboard, and virtual pointer are ready"
+            ),
+            Err(error) => failures.push(format!("isolated Hyprland probe failed: {error}")),
+        }
+    }
+}
+
+fn check_hyprland_protocols(config: &Config) -> io::Result<()> {
+    let (width, height) = probe_size(config);
+    let session = hyprland::HyprlandSession::start(config, probe_environment(width, height))?;
+    probe_capture(session.wayland_socket(), "Hyprland", config, width, height)?;
+    // The window IPC answers `list_windows`/`wait_window`; an empty desktop must still answer.
+    hyprland::query_windows(session.ipc_socket())?;
+    drop(session);
+    Ok(())
+}
+
+/// The geometry the live compositor probes run at: small, even, and independent of the terminal.
+fn probe_size(config: &Config) -> (u32, u32) {
+    (
+        config.width.unwrap_or(640) & !1,
+        config.height.unwrap_or(360) & !1,
+    )
+}
+
+fn probe_environment<'a>(width: u32, height: u32) -> CompositorEnvironment<'a> {
+    CompositorEnvironment {
+        width,
+        height,
+        pulse_server: None,
+        pulse_sink: None,
+        app_window: None,
+    }
+}
+
+/// Capture one frame from a probe session and insist it was retained.
+fn probe_capture(
+    socket: &Path,
+    compositor: &'static str,
+    config: &Config,
+    width: u32,
+    height: u32,
+) -> io::Result<()> {
     let capture = ScreencopyCapture::start(
-        session.wayland_socket(),
+        socket,
+        compositor,
         width,
         height,
         config.fps.clamp(1, 240),
         Instant::now(),
     )?;
     if capture.latest().snapshot()?.is_none() {
-        return Err(io::Error::other(
-            "Sway screencopy succeeded without retaining an initial frame",
-        ));
+        return Err(io::Error::other(format!(
+            "{compositor} screencopy succeeded without retaining an initial frame"
+        )));
     }
     drop(capture);
-    drop(session);
     Ok(())
 }
 

@@ -1,21 +1,27 @@
-//! The compositor seam: one enum, two backends.
+//! The compositor seam: one enum, three backends.
 //!
 //! Everything above this module — session connect, surfaces, track math, workers, prebuffer,
 //! recovery, the status row — is shared. Everything below it is genuinely per-compositor: how the
-//! compositor is launched and proven ready, how a program is launched inside it (Weston spawns
-//! directly, Sway execs through its IPC), how frames are captured, and how input is injected.
+//! compositor is launched and proven ready, how a program is launched inside it (Weston and
+//! Hyprland spawn directly, Sway execs through its IPC), how frames are captured, and how input is
+//! injected.
 //!
-//! Enum dispatch rather than `Box<dyn CompositorSession>`: the two sessions own different state,
+//! The wlroots protocol surface is shared rather than duplicated: Sway and Hyprland both capture
+//! through `capture` and inject through `wlr_input`, and only their launch, readiness and window
+//! IPC differ.
+//!
+//! Enum dispatch rather than `Box<dyn CompositorSession>`: the sessions own different state,
 //! the pipeline calls the same handful of methods, and the enum keeps each session's
 //! `Drop`-kills-its-children behavior without object-safety contortions (plan D3).
 
 pub mod capture;
+pub mod hyprland;
 pub mod pipewire;
 pub mod protocols;
 pub mod sway;
-pub mod sway_input;
 pub mod weston;
 pub mod weston_input;
+pub mod wlr_input;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -29,6 +35,7 @@ use crate::linux::app::AppLaunch;
 use crate::linux::video::CaptureSource;
 
 use capture::ScreencopyCapture;
+use hyprland::HyprlandSession;
 use pipewire::{PIPEWIRE_NODE, VideoCapture};
 use sway::SwaySession;
 use weston::{ActiveBackend, WestonSession};
@@ -40,6 +47,7 @@ pub use crate::cli::CompositorChoice;
 pub enum ResolvedCompositor {
     Weston,
     Sway,
+    Hyprland,
 }
 
 impl ResolvedCompositor {
@@ -51,23 +59,90 @@ impl ResolvedCompositor {
         ProductIdentity {
             slug: "vvland",
             display_name: "Vvland",
-            compositor_name: match self {
-                Self::Weston => "Weston",
-                Self::Sway => "Sway",
-            },
+            compositor_name: self.display_name(),
+        }
+    }
+
+    /// The compositor's own name, as diagnostics and the status row spell it.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Weston => "Weston",
+            Self::Sway => "Sway",
+            Self::Hyprland => "Hyprland",
+        }
+    }
+
+    /// The lowercase name used by the CLI, the session registry, and the control protocol.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Weston => "weston",
+            Self::Sway => "sway",
+            Self::Hyprland => "hyprland",
         }
     }
 
     /// The wire-visible producer name declared in HELLO.
     ///
-    /// Deliberately still the per-compositor name: it rides the wire, appears in WELCOME echoes,
-    /// traces, and session labels, and the `veston`/`vvsway` wrappers exist so old invocations
-    /// keep old behavior. Changing it is a one-line change here plus a presenter-side check
+    /// Weston and Sway keep their per-compositor names: those ride the wire, appear in WELCOME
+    /// echoes, traces, and session labels, and the `veston`/`vvsway` wrappers exist so old
+    /// invocations keep old behavior. Hyprland arrived after the consolidation and has no
+    /// deprecated wrapper to be compatible with, so it announces the binary's own name
     /// (plan D2, risk R1).
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Weston => "veston",
             Self::Sway => "vvsway",
+            Self::Hyprland => "vvland",
+        }
+    }
+}
+
+/// A window observed through a compositor's IPC, in the shape the control protocol publishes.
+///
+/// Sway's tree and Hyprland's client list carry the same facts under different names; normalizing
+/// here is what lets `list_windows` and `wait_window` answer identically on both.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct CompositorWindow {
+    pub id: u64,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    pub xwayland_class: Option<String>,
+    pub pid: Option<u32>,
+    pub rect: WindowRect,
+    pub focused: bool,
+    pub fullscreen: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct WindowRect {
+    pub x: i64,
+    pub y: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A live window-observation IPC endpoint, owned by the session that created it.
+///
+/// Carried by value so the control methods can query from a worker thread without holding the
+/// host: both sockets stay valid for the life of the compositor process.
+#[derive(Clone, Debug)]
+pub enum WindowIpc {
+    Sway(std::path::PathBuf),
+    Hyprland(std::path::PathBuf),
+}
+
+impl WindowIpc {
+    pub fn query(&self) -> io::Result<Vec<CompositorWindow>> {
+        match self {
+            Self::Sway(socket) => sway::query_windows(socket),
+            Self::Hyprland(socket) => hyprland::query_windows(socket),
+        }
+    }
+
+    pub fn compositor(&self) -> &'static str {
+        match self {
+            Self::Sway(_) => "sway",
+            Self::Hyprland(_) => "hyprland",
         }
     }
 }
@@ -99,7 +174,7 @@ pub struct CompositorEnvironment<'a> {
 /// which is `Sized`, and the two transports are known statically anyway (plan D3).
 pub enum LiveInput<'a> {
     Weston(&'a mut weston_input::InputChannel),
-    Sway(&'a mut sway_input::InputChannel),
+    Wlr(&'a mut wlr_input::InputChannel),
 }
 
 impl LiveInput<'_> {
@@ -107,7 +182,7 @@ impl LiveInput<'_> {
     pub fn check_status(&mut self) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.check_status(),
-            Self::Sway(input) => input.check_status(),
+            Self::Wlr(input) => input.check_status(),
         }
     }
 }
@@ -145,35 +220,35 @@ impl TerminalInjector for LiveInput<'_> {
     fn key(&mut self, code: u32, pressed: bool) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.key(code, pressed),
-            Self::Sway(input) => input.key(code, pressed),
+            Self::Wlr(input) => input.key(code, pressed),
         }
     }
 
     fn pointer_absolute(&mut self, x: u32, y: u32) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.pointer_absolute(x, y),
-            Self::Sway(input) => input.pointer_absolute(x, y),
+            Self::Wlr(input) => input.pointer_absolute(x, y),
         }
     }
 
     fn pointer_button(&mut self, button: u32, pressed: bool) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.pointer_button(button, pressed),
-            Self::Sway(input) => input.pointer_button(button, pressed),
+            Self::Wlr(input) => input.pointer_button(button, pressed),
         }
     }
 
     fn pointer_axis(&mut self, axis: u32, delta: i32) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.pointer_axis(axis, delta),
-            Self::Sway(input) => input.pointer_axis(axis, delta),
+            Self::Wlr(input) => input.pointer_axis(axis, delta),
         }
     }
 
     fn release_all(&mut self) -> io::Result<()> {
         match self {
             Self::Weston(input) => input.release_all(),
-            Self::Sway(input) => input.release_all(),
+            Self::Wlr(input) => input.release_all(),
         }
     }
 }
@@ -181,6 +256,7 @@ impl TerminalInjector for LiveInput<'_> {
 pub enum Compositor {
     Weston(WestonSession),
     Sway(SwaySession),
+    Hyprland(HyprlandSession),
 }
 
 impl Compositor {
@@ -188,6 +264,7 @@ impl Compositor {
         match self {
             Self::Weston(session) => session.pid(),
             Self::Sway(session) => session.pid(),
+            Self::Hyprland(session) => session.pid(),
         }
     }
 
@@ -201,6 +278,9 @@ impl Compositor {
                 WestonSession::start(config, environment).map(Self::Weston)
             }
             ResolvedCompositor::Sway => SwaySession::start(config, environment).map(Self::Sway),
+            ResolvedCompositor::Hyprland => {
+                HyprlandSession::start(config, environment).map(Self::Hyprland)
+            }
         }
     }
 
@@ -217,18 +297,34 @@ impl Compositor {
                 VideoCapture::start(PIPEWIRE_NODE, session.pid(), width, height, fps, origin)
                     .map(|capture| Box::new(capture) as Box<dyn CaptureSource + Send + Sync>)
             }
-            Self::Sway(session) => {
-                ScreencopyCapture::start(session.wayland_socket(), width, height, fps, origin)
-                    .map(|capture| Box::new(capture) as Box<dyn CaptureSource + Send + Sync>)
-            }
+            Self::Sway(session) => ScreencopyCapture::start(
+                session.wayland_socket(),
+                "Sway",
+                width,
+                height,
+                fps,
+                origin,
+            )
+            .map(|capture| Box::new(capture) as Box<dyn CaptureSource + Send + Sync>),
+            Self::Hyprland(session) => ScreencopyCapture::start(
+                session.wayland_socket(),
+                "Hyprland",
+                width,
+                height,
+                fps,
+                origin,
+            )
+            .map(|capture| Box::new(capture) as Box<dyn CaptureSource + Send + Sync>),
         }
     }
 
-    /// The active backend name for the status row: Weston's `drm`/`headless`, Sway's `headless`.
+    /// The active backend name for the status row: Weston's `drm`/`headless`, and the `headless`
+    /// output the wlroots-protocol compositors always render to.
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Weston(session) => session.backend().name(),
             Self::Sway(session) => session.backend_name(),
+            Self::Hyprland(session) => session.backend_name(),
         }
     }
 
@@ -236,14 +332,15 @@ impl Compositor {
     pub fn weston_backend(&self) -> Option<ActiveBackend> {
         match self {
             Self::Weston(session) => Some(session.backend()),
-            Self::Sway(_) => None,
+            Self::Sway(_) | Self::Hyprland(_) => None,
         }
     }
 
     pub fn input_mut(&mut self) -> LiveInput<'_> {
         match self {
             Self::Weston(session) => LiveInput::Weston(session.input_mut()),
-            Self::Sway(session) => LiveInput::Sway(session.input_mut()),
+            Self::Sway(session) => LiveInput::Wlr(session.input_mut()),
+            Self::Hyprland(session) => LiveInput::Wlr(session.input_mut()),
         }
     }
 
@@ -251,6 +348,7 @@ impl Compositor {
         match self {
             Self::Weston(session) => session.try_wait(),
             Self::Sway(session) => session.try_wait(),
+            Self::Hyprland(session) => session.try_wait(),
         }
     }
 
@@ -258,20 +356,22 @@ impl Compositor {
         match self {
             Self::Weston(session) => session.launch_program(program),
             Self::Sway(session) => session.launch_program(program),
+            Self::Hyprland(session) => session.launch_program(program),
         }
     }
 
     /// Launch the single application of `--app` mode with its profile environment.
     ///
-    /// Weston spawns it directly, so the profile environment goes on the `Command` and the child
-    /// gets the kitweb liveness probe. Sway execs through its IPC, where there is no child handle
-    /// to probe: the environment is baked into the launcher script and the IPC reply is the
-    /// acknowledgement. Both then leave the window alone — it was already made fullscreen by the
-    /// generated compositor configuration.
+    /// Weston and Hyprland spawn it directly, so the profile environment goes on the `Command`
+    /// and the child gets the kitweb liveness probe. Sway execs through its IPC, where there is no
+    /// child handle to probe: the environment is baked into the launcher script and a recorded
+    /// exit status stands in for the probe. All three then leave the window alone — it was already
+    /// made fullscreen by the generated compositor configuration.
     pub fn launch_app(&mut self, launch: &AppLaunch) -> io::Result<()> {
         match self {
             Self::Weston(session) => session.launch_app(launch),
             Self::Sway(session) => session.launch_app(launch),
+            Self::Hyprland(session) => session.launch_app(launch),
         }
     }
 
@@ -279,13 +379,17 @@ impl Compositor {
         match self {
             Self::Weston(session) => session.launch_shell_command(command_text),
             Self::Sway(session) => session.launch_shell_command(command_text),
+            Self::Hyprland(session) => session.launch_shell_command(command_text),
         }
     }
 
-    pub fn sway_ipc_socket(&self) -> Option<&std::path::Path> {
+    /// The window-observation endpoint, for the compositors that expose one.
+    pub fn window_ipc(&self) -> Option<WindowIpc> {
         match self {
+            // Weston exposes no window-enumeration IPC at all.
             Self::Weston(_) => None,
-            Self::Sway(session) => Some(session.ipc_socket()),
+            Self::Sway(session) => Some(WindowIpc::Sway(session.ipc_socket().to_owned())),
+            Self::Hyprland(session) => Some(WindowIpc::Hyprland(session.ipc_socket().to_owned())),
         }
     }
 }
@@ -306,6 +410,7 @@ pub fn resolve(
     match choice {
         CompositorChoice::Weston => Ok(ResolvedCompositor::Weston),
         CompositorChoice::Sway => Ok(ResolvedCompositor::Sway),
+        CompositorChoice::Hyprland => Ok(ResolvedCompositor::Hyprland),
         CompositorChoice::Auto => {
             // A Weston-only flag is an explicit request for the DRM-capable backend.
             if weston_flags_requested(config) {
@@ -316,6 +421,9 @@ pub fn resolve(
             if preferred == Some(CompositorChoice::Sway) && probe_sway(config).is_ok() {
                 return Ok(ResolvedCompositor::Sway);
             }
+            if preferred == Some(CompositorChoice::Hyprland) && probe_hyprland(config).is_ok() {
+                return Ok(ResolvedCompositor::Hyprland);
+            }
             let weston = probe_weston(config);
             if weston.is_ok() {
                 return Ok(ResolvedCompositor::Weston);
@@ -324,12 +432,20 @@ pub fn resolve(
             if sway.is_ok() {
                 return Ok(ResolvedCompositor::Sway);
             }
+            // Hyprland comes last under `auto`: its version probe cannot tell whether this host
+            // will give aquamarine a GPU to allocate from, so a host that can run either of the
+            // other two should.
+            let hyprland = probe_hyprland(config);
+            if hyprland.is_ok() {
+                return Ok(ResolvedCompositor::Hyprland);
+            }
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "no usable compositor: weston ({}); sway ({})",
+                    "no usable compositor: weston ({}); sway ({}); hyprland ({})",
                     weston.unwrap_err(),
-                    sway.unwrap_err()
+                    sway.unwrap_err(),
+                    hyprland.unwrap_err()
                 ),
             ))
         }
@@ -363,6 +479,21 @@ pub fn probe_weston(config: &Config) -> Result<String, String> {
     Ok(version)
 }
 
+/// Hyprland is usable when the binary reports a release whose configuration this build can
+/// generate. Whether the host can actually give aquamarine an allocator only shows at startup.
+pub fn probe_hyprland(config: &Config) -> Result<String, String> {
+    let version = hyprland::hyprland_version(&config.hyprland)
+        .map_err(|error| format!("could not execute Hyprland: {error}"))?;
+    if hyprland::hyprland_supported(&version) {
+        Ok(version)
+    } else {
+        Err(format!(
+            "hyprland 0.53 or newer is required; found {}",
+            version.trim()
+        ))
+    }
+}
+
 /// Sway is usable when the binary reports 1.9 or newer.
 pub fn probe_sway(config: &Config) -> Result<String, String> {
     let version = sway::sway_version(&config.sway)
@@ -389,6 +520,9 @@ mod tests {
         assert_eq!(weston.compositor_name, "Weston");
         assert_eq!(ResolvedCompositor::Sway.identity().compositor_name, "Sway");
         assert_eq!(ResolvedCompositor::Sway.identity().slug, "vvland");
+        let hyprland = ResolvedCompositor::Hyprland.identity();
+        assert_eq!(hyprland.slug, "vvland");
+        assert_eq!(hyprland.compositor_name, "Hyprland");
     }
 
     #[test]
@@ -397,15 +531,24 @@ mod tests {
         // silently rename the producer (plan D2, risk R1).
         assert_eq!(ResolvedCompositor::Weston.wire_name(), "veston");
         assert_eq!(ResolvedCompositor::Sway.wire_name(), "vvsway");
+        // Hyprland has no deprecated wrapper to stay compatible with, so it announces vvland.
+        assert_eq!(ResolvedCompositor::Hyprland.wire_name(), "vvland");
+        for compositor in [
+            ResolvedCompositor::Weston,
+            ResolvedCompositor::Sway,
+            ResolvedCompositor::Hyprland,
+        ] {
+            assert_eq!(compositor.name(), compositor.display_name().to_lowercase());
+        }
     }
 
     #[test]
-    fn both_compositors_reject_the_same_out_of_range_pointer_positions() {
+    fn every_compositor_rejects_the_same_out_of_range_pointer_positions() {
         // The parity that matters: the last valid pixel is accepted and the first invalid one is
-        // rejected, identically for both transports, because both run this one predicate. Sway
+        // rejected, identically for every transport, because they all run this one predicate. Sway
         // used to clamp here, which made an out-of-range click look like a successful click on a
         // neighbouring pixel.
-        for compositor in ["Weston", "Sway"] {
+        for compositor in ["Weston", "Sway", "Hyprland"] {
             assert!(check_pointer_bounds(1919, 1079, 1920, 1080, compositor).is_ok());
             assert!(check_pointer_bounds(0, 0, 1920, 1080, compositor).is_ok());
             for (x, y) in [(1920, 0), (0, 1080), (1920, 1080), (u32::MAX, 0)] {
@@ -441,6 +584,10 @@ mod tests {
         assert_eq!(
             resolve(CompositorChoice::Sway, &config, None).unwrap(),
             ResolvedCompositor::Sway
+        );
+        assert_eq!(
+            resolve(CompositorChoice::Hyprland, &config, None).unwrap(),
+            ResolvedCompositor::Hyprland
         );
     }
 

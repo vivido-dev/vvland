@@ -1,9 +1,9 @@
 //! Launcher scaffolding shared by every compositor backend.
 //!
-//! Both sessions independently grew the same private runtime directory, private file writer,
+//! The sessions independently grew the same private runtime directory, private file writer,
 //! bounded log drain, process-group teardown, and PATH probe (plan D7). They live here once; the
 //! backends keep only what genuinely differs — readiness protocols, the launcher mechanism
-//! (Weston spawns directly, Sway execs through its IPC), and the input transport.
+//! (Weston and Hyprland spawn directly, Sway execs through its IPC), and the input transport.
 
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -25,16 +25,60 @@ pub struct RuntimeDirectory {
     pub path: PathBuf,
 }
 
+/// The longest path a `sockaddr_un` can carry, once the NUL terminator is subtracted.
+pub const MAX_UNIX_SOCKET_PATH: usize = 107;
+
+/// `vv` plus six hex digits, and the `/` that joins it to its base.
+const SHORT_NAME_LENGTH: usize = 9;
+
 impl RuntimeDirectory {
     pub fn create() -> io::Result<Self> {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        Self::create_in(&default_base(), "vvland-", 8)
+    }
+
+    /// A private runtime directory short enough for a compositor that binds sockets below it.
+    ///
+    /// Hyprland binds `<directory>/hypr/<instance signature>/.socket.sock`, and the signature
+    /// alone is its sixty-odd-character build hash, timestamp and nonce. The ordinary name
+    /// overruns `sun_path` on a perfectly normal `/run/user/<uid>`, and Hyprland's answer to that
+    /// is to log "IPC will not work" and carry on — so the room is reserved up front, and `/tmp`
+    /// stands in when even a short name does not fit under `XDG_RUNTIME_DIR`.
+    ///
+    /// `reserve` is the longest path the caller will append, the joining `/` included.
+    pub fn create_short(reserve: usize) -> io::Result<Self> {
+        let mut bases = vec![default_base()];
+        if bases[0] != Path::new("/tmp") {
+            bases.push(PathBuf::from("/tmp"));
+        }
+        for base in &bases {
+            if base.as_os_str().len() + SHORT_NAME_LENGTH + reserve <= MAX_UNIX_SOCKET_PATH {
+                return Self::create_in(base, "vv", 3);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "no runtime directory is short enough to hold a {reserve}-byte socket path; \
+                 tried {}",
+                bases
+                    .iter()
+                    .map(|base| base.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
+    }
+
+    fn create_in(base: &Path, prefix: &str, random_bytes: usize) -> io::Result<Self> {
         for _ in 0..32 {
             let mut random = [0_u8; 8];
-            getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
-            let path = base.join(format!("vvland-{:016x}", u64::from_be_bytes(random)));
+            getrandom::fill(&mut random[..random_bytes])
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let width = random_bytes * 2;
+            let path = base.join(format!(
+                "{prefix}{:0width$x}",
+                u64::from_be_bytes(random) >> (64 - random_bytes * 8)
+            ));
             match DirBuilder::new().mode(0o700).create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -46,6 +90,13 @@ impl RuntimeDirectory {
             "could not allocate a private vvland runtime directory",
         ))
     }
+}
+
+fn default_base() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 impl Drop for RuntimeDirectory {
@@ -205,7 +256,7 @@ pub fn xwayland_enabled(policy: Xwayland) -> bool {
 
 /// Strip every variable that would leak this session's credentials or the host's display.
 ///
-/// Unified on the Sway superset and applied to both compositors and every launched program:
+/// Unified on the Sway superset and applied to every compositor and every launched program:
 /// a nested client that inherits the outer `WAYLAND_DISPLAY` connects to the wrong compositor,
 /// and `VIVID_*` carries the root secret. `PIPEWIRE_RUNTIME_DIR` and the private Pulse routing
 /// are re-set explicitly afterwards by the backends that need them.
@@ -228,6 +279,10 @@ pub fn remove_child_environment(name: &OsStr) -> bool {
                 | "DISPLAY"
                 | "SWAYSOCK"
                 | "I3SOCK"
+                // An outer Hyprland's instance signature would point a nested client's `hyprctl`
+                // at the host compositor rather than this session's.
+                | "HYPRLAND_INSTANCE_SIGNATURE"
+                | "HYPRLAND_CMD"
                 | "PULSE_SERVER"
                 | "PULSE_SINK"
                 | "PULSE_SOURCE"
@@ -268,6 +323,21 @@ pub fn confirm_started(name: &str, child: &mut Child) -> io::Result<()> {
     }
 }
 
+/// Point a launched client at one session: its private runtime directory, display, and Pulse
+/// routing. Shared because every direct-spawn backend needs exactly this set.
+pub fn set_client_environment(
+    command: &mut Command,
+    runtime: &Path,
+    wayland_display: &str,
+    pulse_server: Option<&OsStr>,
+    pulse_sink: Option<&OsStr>,
+) {
+    command
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("WAYLAND_DISPLAY", wayland_display);
+    set_pulse_environment(command, pulse_server, pulse_sink);
+}
+
 pub fn set_pulse_environment(
     command: &mut Command,
     pulse_server: Option<&OsStr>,
@@ -302,6 +372,8 @@ mod tests {
             "DISPLAY",
             "SWAYSOCK",
             "I3SOCK",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "HYPRLAND_CMD",
             "PULSE_SERVER",
             "PULSE_SINK",
             "PULSE_SOURCE",

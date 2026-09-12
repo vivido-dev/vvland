@@ -144,6 +144,7 @@ fn append_server_config(command: &mut Command, config: &Config) {
     command.arg(format!("--backend={}", backend_name(config.backend)));
     command.arg("--weston").arg(&config.weston);
     command.arg("--sway").arg(&config.sway);
+    command.arg("--hyprland").arg(&config.hyprland);
     command.arg(format!("--renderer={}", renderer_name(config.renderer)));
     command.arg(format!("--fps={}", config.fps));
     command.arg(format!("--bitrate={}", config.bitrate));
@@ -194,6 +195,7 @@ fn compositor_name(value: CompositorChoice) -> &'static str {
         CompositorChoice::Auto => "auto",
         CompositorChoice::Weston => "weston",
         CompositorChoice::Sway => "sway",
+        CompositorChoice::Hyprland => "hyprland",
     }
 }
 

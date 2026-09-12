@@ -1,3 +1,9 @@
+//! Virtual keyboard and pointer injection for the wlroots-protocol compositors.
+//!
+//! Sway and Hyprland both advertise `zwp_virtual_keyboard_manager_v1` and
+//! `zwlr_virtual_pointer_manager_v1`, so one channel drives both; only the name in diagnostics
+//! differs, which is why `compositor` is carried rather than hard-coded.
+
 use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::File;
@@ -51,6 +57,7 @@ delegate_noop!(InputState: ignore zwlr_virtual_pointer_manager_v1::ZwlrVirtualPo
 delegate_noop!(InputState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
 
 pub struct InputChannel {
+    compositor: &'static str,
     connection: Connection,
     queue: EventQueue<InputState>,
     state: InputState,
@@ -82,6 +89,7 @@ impl InputChannel {
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         socket: &Path,
+        compositor: &'static str,
         width: u32,
         height: u32,
         model: Option<&str>,
@@ -102,9 +110,9 @@ impl InputChannel {
         let qh = queue.handle();
 
         let seat_global = first_global(&globals, wl_seat::WlSeat::interface().name)
-            .ok_or_else(|| missing_global("wl_seat"))?;
+            .ok_or_else(|| missing_global(compositor, "wl_seat"))?;
         let output_global = first_global(&globals, wl_output::WlOutput::interface().name)
-            .ok_or_else(|| missing_global("wl_output"))?;
+            .ok_or_else(|| missing_global(compositor, "wl_output"))?;
         let seat: wl_seat::WlSeat = globals.registry().bind(
             seat_global.name,
             seat_global
@@ -156,6 +164,7 @@ impl InputChannel {
         connection.flush().map_err(wayland_error)?;
 
         Ok(Self {
+            compositor,
             connection,
             queue,
             state: InputState,
@@ -217,13 +226,13 @@ impl InputChannel {
     /// This used to clamp. Clamping turns "click the button at (2000, 500)" on a 1920-wide output
     /// into a click at (1919, 500), which a caller cannot tell apart from success — so a caller
     /// that computed a coordinate wrongly gets a plausible-looking wrong click instead of an
-    /// error. Weston has always rejected (`weston_input.rs`), and one answer on both compositors
+    /// error. Weston has always rejected (`weston_input.rs`), and one answer on every compositor
     /// is worth more than the clamp ever was. Both in-tree callers already bound their
     /// coordinates before reaching here: `Placement::pointer`/`pointer_clamped` end in a `min`
     /// against the capture size, and `desktop_input::to_pixel` rejects first.
     pub fn pointer_absolute(&mut self, x: u32, y: u32) -> io::Result<()> {
         self.ensure_open()?;
-        super::check_pointer_bounds(x, y, self.width, self.height, "Sway")?;
+        super::check_pointer_bounds(x, y, self.width, self.height, self.compositor)?;
         self.pointer
             .motion_absolute(self.timestamp(), x, y, self.width, self.height);
         self.pointer.frame();
@@ -412,10 +421,10 @@ fn anonymous_file() -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn missing_global(name: &str) -> io::Error {
+fn missing_global(compositor: &str, name: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        format!("Sway does not advertise required Wayland global {name}"),
+        format!("{compositor} does not advertise required Wayland global {name}"),
     )
 }
 

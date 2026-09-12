@@ -1661,6 +1661,7 @@ fn display_grid_dimension(grid: u32, label: &str) -> u32 {
 fn compositor_label(product: &crate::producer::ProductIdentity) -> &'static str {
     match product.compositor_name {
         "Sway" => "sway",
+        "Hyprland" => "hyprland",
         _ => "weston",
     }
 }

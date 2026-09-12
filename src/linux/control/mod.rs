@@ -37,7 +37,8 @@ pub const METHODS: &[&str] = &[
     "shutdown",
 ];
 
-pub const SWAY_METHODS: &[&str] = &["list_windows", "wait_window"];
+/// The methods only a compositor with a window-observation IPC can answer.
+pub const WINDOW_METHODS: &[&str] = &["list_windows", "wait_window"];
 
 pub use crate::control_cli::EVENT_KINDS;
 

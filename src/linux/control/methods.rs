@@ -31,7 +31,6 @@ use crate::control_cli::{
 };
 use crate::linux::compositor::ResolvedCompositor;
 use crate::linux::compositor::check_pointer_bounds;
-use crate::linux::compositor::sway::query_windows;
 use crate::linux::host::DesktopHost;
 use crate::linux::pipeline::{self, PresenterSource};
 
@@ -39,7 +38,7 @@ use super::screenshot;
 use super::watch::{ScreenSnapshot, ScreenWatch, WatchLease};
 use super::{
     ActorRequest, AttachParams, ControlContext, ERROR_CODES, EVENT_KINDS, EventSendError,
-    EventSink, HostInputCall, METHODS, PresenterInput, Responder, SWAY_METHODS,
+    EventSink, HostInputCall, METHODS, PresenterInput, Responder, WINDOW_METHODS,
 };
 
 const ACTOR_TICK: Duration = Duration::from_millis(5);
@@ -299,11 +298,11 @@ impl Actor {
                 "exact_available": true,
             }
         });
-        if resolved == ResolvedCompositor::Sway {
+        if let Some(windows) = self.host.window_ipc() {
             capabilities["windows"] = json!({
                 "enumeration": true,
                 "wait_match": "exact_app_id",
-                "compositor": "sway",
+                "compositor": windows.compositor(),
             });
         }
         capabilities
@@ -334,10 +333,7 @@ impl Actor {
         let resolved = self.host.resolved();
         Ok(json!({
             "session": self.context.session,
-            "compositor": match resolved {
-                crate::linux::compositor::ResolvedCompositor::Weston => "weston",
-                crate::linux::compositor::ResolvedCompositor::Sway => "sway",
-            },
+            "compositor": resolved.name(),
             "backend": self.host.backend_name(),
             "wire_name": resolved.wire_name(),
             "width": width,
@@ -726,12 +722,12 @@ impl Actor {
         if let Err(error) = expect_empty(&params) {
             return response.error(error);
         }
-        let Some(socket) = self.host.sway_ipc_socket() else {
+        let Some(windows) = self.host.window_ipc() else {
             return response.error(window_unsupported());
         };
         self.spawn_worker("vvland-list-windows", response, move || {
-            let windows = query_windows(&socket).map_err(window_query_error)?;
-            Ok(json!({"windows": windows}))
+            let listed = windows.query().map_err(window_query_error)?;
+            Ok(json!({"windows": listed}))
         });
     }
 
@@ -959,14 +955,14 @@ impl Actor {
         }) {
             return response.error(invalid_params(error));
         }
-        let Some(socket) = self.host.sway_ipc_socket() else {
+        let Some(windows) = self.host.window_ipc() else {
             return response.error(window_unsupported());
         };
         self.spawn_worker("vvland-wait-window", response, move || {
             let deadline = Instant::now() + Duration::from_millis(params.timeout_ms);
             loop {
-                let windows = query_windows(&socket).map_err(window_query_error)?;
-                if let Some(window) = windows
+                let listed = windows.query().map_err(window_query_error)?;
+                if let Some(window) = listed
                     .into_iter()
                     .find(|window| window.app_id.as_deref() == Some(params.app_id.as_str()))
                 {
@@ -1441,8 +1437,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 fn methods_for(compositor: ResolvedCompositor) -> Vec<&'static str> {
     let mut methods = METHODS.to_vec();
-    if compositor == ResolvedCompositor::Sway {
-        methods.extend_from_slice(SWAY_METHODS);
+    // Weston is the one backend with no window-enumeration IPC to answer them.
+    if compositor != ResolvedCompositor::Weston {
+        methods.extend_from_slice(WINDOW_METHODS);
     }
     methods
 }
@@ -1461,7 +1458,7 @@ fn window_unsupported() -> IpcError {
 fn window_query_error(error: io::Error) -> IpcError {
     IpcError::new(
         "invalid_state",
-        format!("could not query the Sway window tree: {error}"),
+        format!("could not query the compositor's window list: {error}"),
     )
 }
 
@@ -1632,11 +1629,13 @@ mod tests {
     }
 
     #[test]
-    fn window_methods_are_advertised_only_for_sway() {
+    fn window_methods_are_advertised_by_every_compositor_with_a_window_ipc() {
         assert_eq!(methods_for(ResolvedCompositor::Weston), METHODS);
-        let sway = methods_for(ResolvedCompositor::Sway);
-        assert_eq!(&sway[..METHODS.len()], METHODS);
-        assert_eq!(&sway[METHODS.len()..], SWAY_METHODS);
+        for compositor in [ResolvedCompositor::Sway, ResolvedCompositor::Hyprland] {
+            let methods = methods_for(compositor);
+            assert_eq!(&methods[..METHODS.len()], METHODS, "{compositor:?}");
+            assert_eq!(&methods[METHODS.len()..], WINDOW_METHODS, "{compositor:?}");
+        }
 
         let unsupported = window_unsupported();
         assert_eq!(unsupported.code, "unsupported");

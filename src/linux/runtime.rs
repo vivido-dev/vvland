@@ -327,7 +327,7 @@ fn validate_registry(registry: &SessionRegistry) -> io::Result<()> {
         && registry.protocol_version == CONTROL_PROTOCOL_VERSION
         && is_lower_hex(&registry.endpoint_id, 64)
         && registry.socket.is_absolute()
-        && matches!(registry.compositor.as_str(), "weston" | "sway")
+        && matches!(registry.compositor.as_str(), "weston" | "sway" | "hyprland")
         && (MIN_DIMENSION..=MAX_DIMENSION).contains(&registry.width)
         && (MIN_DIMENSION..=MAX_DIMENSION).contains(&registry.height);
     if !valid {
@@ -530,10 +530,7 @@ fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
 
 #[allow(dead_code)] // Called by `write_registry`, whose production caller lands in H5.
 fn compositor_name(compositor: ResolvedCompositor) -> &'static str {
-    match compositor {
-        ResolvedCompositor::Weston => "weston",
-        ResolvedCompositor::Sway => "sway",
-    }
+    compositor.name()
 }
 
 fn effective_uid() -> u32 {

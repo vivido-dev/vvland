@@ -21,7 +21,7 @@ use crate::cli::{Backend, Config};
 use super::app::{self, AppLaunch};
 use super::compositor::weston::{ActiveBackend, drm_native_mode};
 use super::compositor::{
-    AppWindow, Compositor, CompositorEnvironment, LiveInput, ResolvedCompositor,
+    AppWindow, Compositor, CompositorEnvironment, LiveInput, ResolvedCompositor, WindowIpc,
     resolve as resolve_compositor,
 };
 use super::video::{CaptureSource, LatestFrame};
@@ -173,8 +173,8 @@ impl DesktopHost {
             compositor_environment(dimensions, pulse.as_ref(), plan.app_window),
         )?;
         // Weston's DRM sizing dance moves as one unit: if startup selected headless after the
-        // optimistic native-mode size, restart at the requested headless size.  Sway has no DRM
-        // leg and cannot take this path.
+        // optimistic native-mode size, restart at the requested headless size.  The
+        // wlroots-protocol compositors have no DRM leg and cannot take this path.
         if compositor.weston_backend() == Some(ActiveBackend::Headless)
             && dimensions != headless_size
         {
@@ -401,8 +401,8 @@ impl DesktopHost {
         self.pulse.is_some()
     }
 
-    pub fn sway_ipc_socket(&self) -> Option<std::path::PathBuf> {
-        self.compositor.sway_ipc_socket().map(ToOwned::to_owned)
+    pub fn window_ipc(&self) -> Option<WindowIpc> {
+        self.compositor.window_ipc()
     }
 
     /// Launch the program selected by `--app`, or the trailing program for a normal desktop.
@@ -483,14 +483,14 @@ fn compositor_environment(
 /// The size the compositor should start at.
 ///
 /// Weston can drive a physical connector, so it starts at that connector's native mode when one
-/// is available and falls back to the headless size otherwise. Sway is headless-only and always
-/// uses the headless size.
+/// is available and falls back to the headless size otherwise. Sway and Hyprland render to a
+/// headless output and always use the headless size.
 fn initial_size(
     config: &Config,
     compositor: ResolvedCompositor,
     headless: (u32, u32),
 ) -> io::Result<(Config, (u32, u32))> {
-    if compositor == ResolvedCompositor::Sway || config.backend == Backend::Headless {
+    if compositor != ResolvedCompositor::Weston || config.backend == Backend::Headless {
         return Ok((config.clone(), headless));
     }
     let output = config.drm_output.clone().or_else(|| {

@@ -9,7 +9,10 @@
 //! ```
 //!
 //! Preconditions (each failure to meet one is reported per test, never a silent pass):
-//! - `weston`, `sway`, `pipewire`, and a Pulse-compatible server on `PATH`;
+//! - `weston`, `sway`, `Hyprland`, `pipewire`, and a Pulse-compatible server on `PATH`;
+//! - for the Hyprland tests, a GPU aquamarine can open: Hyprland has no standalone headless
+//!   backend, so a host with no `/dev/dri` or with another compositor holding DRM master cannot
+//!   run them;
 //! - a live host PipeWire daemon reachable through `$XDG_RUNTIME_DIR` (or
 //!   `PIPEWIRE_RUNTIME_DIR`);
 //! - `VVLAND_TEST_APP` set (default `thunar`); the app must quit on Ctrl+Q;
@@ -494,6 +497,12 @@ fn live_e2e_core_flow_on_sway() {
     core_flow("sway");
 }
 
+#[test]
+#[ignore = "live: requires Hyprland and a GPU it can open"]
+fn live_e2e_core_flow_on_hyprland() {
+    core_flow("hyprland");
+}
+
 // ---------------------------------------------------------------------------
 // §7.4 plus items
 // ---------------------------------------------------------------------------
@@ -576,6 +585,12 @@ fn live_e2e_scroll_parity_on_sway() {
     scroll_parity("sway");
 }
 
+#[test]
+#[ignore = "live: requires Hyprland and a GPU it can open"]
+fn live_e2e_scroll_parity_on_hyprland() {
+    scroll_parity("hyprland");
+}
+
 fn out_of_range_is_rejected(compositor: &'static str) {
     let session = TestSession::new("bounds", compositor);
     session.serve(None, None);
@@ -602,6 +617,12 @@ fn live_e2e_out_of_range_click_rejected_on_weston() {
 #[ignore = "live: requires Sway and PipeWire"]
 fn live_e2e_out_of_range_click_rejected_on_sway() {
     out_of_range_is_rejected("sway");
+}
+
+#[test]
+#[ignore = "live: requires Hyprland and a GPU it can open"]
+fn live_e2e_out_of_range_click_rejected_on_hyprland() {
+    out_of_range_is_rejected("hyprland");
 }
 
 fn serve_failure_reports_diagnostic(compositor: &'static str) {
@@ -646,6 +667,79 @@ fn live_e2e_serve_failure_reports_diagnostic_on_weston() {
 #[ignore = "live: requires the compositors on PATH"]
 fn live_e2e_serve_failure_reports_diagnostic_on_sway() {
     serve_failure_reports_diagnostic("sway");
+}
+
+#[test]
+#[ignore = "live: requires the compositors on PATH"]
+fn live_e2e_serve_failure_reports_diagnostic_on_hyprland() {
+    serve_failure_reports_diagnostic("hyprland");
+}
+
+// ---------------------------------------------------------------------------
+// Window observation: the two compositors that have it answer in one schema
+// ---------------------------------------------------------------------------
+
+/// A launched application is enumerated, and waited for, identically on Sway and Hyprland.
+///
+/// The point is the normalization: Sway reports a tree of nodes and Hyprland a list of clients,
+/// and `list_windows`/`wait_window` are only useful to a caller if the same application comes
+/// back the same way from both.
+fn window_observation_reports_the_launched_app(compositor: &'static str) {
+    let session = TestSession::new("windows", compositor);
+    session.serve(None, None);
+    session.wait_ready();
+    // An empty desktop enumerates as an empty list rather than an error.
+    let empty = msg_json(&session, &["list-windows"]);
+    assert_eq!(
+        empty["windows"].as_array().map(Vec::len),
+        Some(0),
+        "an idle desktop reported windows: {empty}"
+    );
+
+    let app = expected_app();
+    msg_ok(&session, &["launch", "--", &app]);
+    let waited = msg_json(
+        &session,
+        &["wait", "window", "--app-id", &app, "--timeout-ms", "30000"],
+    );
+    let window = &waited["window"];
+    assert_eq!(window["app_id"], app.as_str(), "wait window: {waited}");
+    assert!(
+        window["pid"].as_u64().is_some_and(|pid| pid > 0),
+        "wait window: {waited}"
+    );
+    let (width, height) = session.dimensions();
+    let rectangle = &window["rect"];
+    assert!(
+        rectangle["width"]
+            .as_u64()
+            .is_some_and(|w| w <= u64::from(width))
+            && rectangle["height"]
+                .as_u64()
+                .is_some_and(|h| h <= u64::from(height)),
+        "window is larger than the output: {waited}"
+    );
+
+    let listed = msg_json(&session, &["list-windows"]);
+    let windows = listed["windows"].as_array().expect("windows array");
+    assert!(
+        windows
+            .iter()
+            .any(|listed| listed["app_id"] == app.as_str() && listed["id"] == window["id"]),
+        "list_windows disagreed with wait_window: {listed}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires Sway and PipeWire"]
+fn live_e2e_window_observation_on_sway() {
+    window_observation_reports_the_launched_app("sway");
+}
+
+#[test]
+#[ignore = "live: requires Hyprland and a GPU it can open"]
+fn live_e2e_window_observation_on_hyprland() {
+    window_observation_reports_the_launched_app("hyprland");
 }
 
 // ---------------------------------------------------------------------------
