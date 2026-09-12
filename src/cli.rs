@@ -540,6 +540,16 @@ pub struct Config {
     #[arg(long)]
     pub xkb_options: Option<String>,
 
+    /// Extra compositor configuration appended to the generated one.
+    ///
+    /// The session runs a self-contained generated configuration, so `~/.config/hypr/hyprland.conf`
+    /// and `~/.config/sway/config` are never read. This file is the escape hatch: its directives
+    /// are appended verbatim and override the generated ones, which is where an `exec-once` dock,
+    /// extra binds, or window rules belong. Weston's configuration is sectioned, so the file must
+    /// open with its own `[section]` header.
+    #[arg(long, value_name = "PATH")]
+    pub extra_config: Option<PathBuf>,
+
     #[arg(long)]
     pub doctor: bool,
 
@@ -776,6 +786,7 @@ pub(crate) mod tests {
             xkb_layout: "us".into(),
             xkb_variant: None,
             xkb_options: None,
+            extra_config: None,
             doctor: false,
             desktop_target: false,
             endpoint_control: Some(Zeroizing::new("unix:/tmp/vivid.sock".into())),

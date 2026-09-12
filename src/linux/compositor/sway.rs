@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use crate::cli::{Config, Renderer};
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_logs_enabled, pipe, sanitize_child_environment, start_bounded_log,
-    startup_error, terminate_group, write_private_file, xwayland_enabled,
+    RuntimeDirectory, child_logs_enabled, pipe, push_extra_config, read_extra_config,
+    sanitize_child_environment, start_bounded_log, startup_error, terminate_group,
+    write_private_file, xwayland_enabled,
 };
 
 use super::wlr_input::InputChannel;
@@ -53,14 +54,22 @@ pub struct SwaySession {
 impl SwaySession {
     pub fn start(config: &Config, environment: CompositorEnvironment<'_>) -> io::Result<Self> {
         require_supported_sway(&config.sway)?;
-        let first = match Self::start_once(config, &environment, config.renderer) {
+        // Read before the renderer retry so a bad --extra-config is reported as itself rather
+        // than twice inside a "failed with the automatic renderer and Pixman" message.
+        let extra = config
+            .extra_config
+            .as_deref()
+            .map(read_extra_config)
+            .transpose()?;
+        let extra = extra.as_deref();
+        let first = match Self::start_once(config, &environment, config.renderer, extra) {
             Ok(session) => return Ok(session),
             Err(error) => error,
         };
         let Some(fallback) = automatic_renderer_fallback(config.renderer) else {
             return Err(first);
         };
-        Self::start_once(config, &environment, fallback).map_err(|second| {
+        Self::start_once(config, &environment, fallback, extra).map_err(|second| {
             io::Error::other(format!(
                 "Sway failed with the automatic renderer ({first}) and Pixman ({second})"
             ))
@@ -71,6 +80,7 @@ impl SwaySession {
         config: &Config,
         environment: &CompositorEnvironment<'_>,
         renderer: Renderer,
+        extra: Option<&str>,
     ) -> io::Result<Self> {
         let runtime = RuntimeDirectory::create()?;
         let config_path = runtime.path.join("config");
@@ -84,6 +94,7 @@ impl SwaySession {
             &config.xkb_layout,
             config.xkb_variant.as_deref(),
             config.xkb_options.as_deref(),
+            extra,
         );
         write_private_file(&config_path, generated.as_bytes(), 0o600)?;
 
@@ -315,6 +326,7 @@ fn sway_config(
     xkb_layout: &str,
     xkb_variant: Option<&str>,
     xkb_options: Option<&str>,
+    extra: Option<&str>,
 ) -> String {
     let mut config = format!(
         "xwayland {}\n\
@@ -373,6 +385,7 @@ fn sway_config(
         config.push_str(&format!("    xkb_options \"{}\"\n", sway_escape(options)));
     }
     config.push_str("}\n");
+    push_extra_config(&mut config, extra);
     config
 }
 
@@ -773,6 +786,7 @@ mod tests {
             "us",
             None,
             Some("compose:ralt"),
+            None,
         );
         assert!(config.contains("output HEADLESS-1 mode --custom 1280x720@30Hz"));
         assert!(config.contains("xwayland disable"));
@@ -782,14 +796,49 @@ mod tests {
     }
 
     #[test]
+    fn extra_configuration_follows_the_generated_directives() {
+        let config = sway_config(
+            1280,
+            720,
+            30,
+            None,
+            false,
+            None,
+            "us",
+            None,
+            None,
+            Some("exec waybar"),
+        );
+        let generated_end = config
+            .find("exec waybar")
+            .expect("extra configuration is present");
+        assert!(
+            config[..generated_end].contains("output HEADLESS-1 mode --custom 1280x720@30Hz"),
+            "{config}"
+        );
+        assert!(config.ends_with("exec waybar\n"), "{config}");
+    }
+
+    #[test]
     fn config_values_are_escaped_before_insertion() {
-        let config = sway_config(640, 360, 30, None, false, None, "us\"\\layout", None, None);
+        let config = sway_config(
+            640,
+            360,
+            30,
+            None,
+            false,
+            None,
+            "us\"\\layout",
+            None,
+            None,
+            None,
+        );
         assert!(config.contains(r#"xkb_layout "us\"\\layout""#));
     }
 
     #[test]
     fn single_app_mode_dedicates_the_output_to_one_window() {
-        let plain = sway_config(1280, 720, 30, None, false, None, "us", None, None);
+        let plain = sway_config(1280, 720, 30, None, false, None, "us", None, None, None);
         assert!(!plain.contains("for_window"));
 
         let app = sway_config(
@@ -803,6 +852,7 @@ mod tests {
             false,
             None,
             "us",
+            None,
             None,
             None,
         );
@@ -822,6 +872,7 @@ mod tests {
             false,
             None,
             "us",
+            None,
             None,
             None,
         );
@@ -844,6 +895,7 @@ mod tests {
             false,
             None,
             "us",
+            None,
             None,
             None,
         );

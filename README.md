@@ -53,6 +53,11 @@ Compositor:
     vvland --compositor sway -- weston-simple-egl
     vvland --compositor hyprland -- foot
 
+Extra compositor configuration (the generated config is self-contained; your own
+`hyprland.conf` or `sway/config` is never read):
+
+    vvland --compositor hyprland --extra-config ~/.config/vvland/dock.conf -- foot
+
 Compositor with app:
 
     vvland --compositor sway -- weston-simple-egl

@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 use crate::cli::Config;
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_logs_enabled, child_output, confirm_started, pipe,
-    sanitize_child_environment, set_client_environment, set_pulse_environment, start_bounded_log,
-    startup_error, terminate_group, write_private_file, xwayland_enabled,
+    RuntimeDirectory, child_logs_enabled, child_output, confirm_started, pipe, push_extra_config,
+    read_extra_config, sanitize_child_environment, set_client_environment, set_pulse_environment,
+    start_bounded_log, startup_error, terminate_group, write_private_file, xwayland_enabled,
 };
 
 use super::wlr_input::InputChannel;
@@ -86,6 +86,11 @@ impl HyprlandSession {
         require_supported_hyprland(&config.hyprland)?;
         let runtime = RuntimeDirectory::create_short(INSTANCE_PATH_BUDGET)?;
         let config_path = runtime.path.join("hyprland.conf");
+        let extra = config
+            .extra_config
+            .as_deref()
+            .map(read_extra_config)
+            .transpose()?;
         let generated = hyprland_config(
             environment.width,
             environment.height,
@@ -96,6 +101,7 @@ impl HyprlandSession {
             &config.xkb_layout,
             config.xkb_variant.as_deref(),
             config.xkb_options.as_deref(),
+            extra.as_deref(),
         )?;
         write_private_file(&config_path, generated.as_bytes(), 0o600)?;
 
@@ -618,6 +624,7 @@ fn hyprland_config(
     xkb_layout: &str,
     xkb_variant: Option<&str>,
     xkb_options: Option<&str>,
+    extra: Option<&str>,
 ) -> io::Result<String> {
     // Hyprland's verbose logging also writes an *unbounded* file of its own inside the runtime
     // directory, which vvland's bounded drain cannot cap — its quiet default stops growing after
@@ -721,6 +728,7 @@ fn hyprland_config(
             ));
         }
     }
+    push_extra_config(&mut config, extra);
     Ok(config)
 }
 
@@ -923,7 +931,8 @@ mod tests {
 
     #[test]
     fn generated_config_pins_the_headless_output_and_darkens_connectors() {
-        let config = hyprland_config(1920, 1080, 30, None, true, None, "us", None, None).unwrap();
+        let config =
+            hyprland_config(1920, 1080, 30, None, true, None, "us", None, None, None).unwrap();
         // Hyprland's own log file is not drained by vvland and grows without bound while its
         // verbose mode is on, so an ordinary session leaves that mode alone.
         assert!(
@@ -942,6 +951,37 @@ mod tests {
     }
 
     #[test]
+    fn extra_configuration_follows_the_generated_directives() {
+        // The user's own hyprland.conf is never read, so `exec-once` for a dock or a bar arrives
+        // through --extra-config and must land after — and therefore win over — the generated
+        // body it is appended to.
+        let config = hyprland_config(
+            1920,
+            1080,
+            30,
+            None,
+            true,
+            None,
+            "us",
+            None,
+            None,
+            Some("exec-once = nwg-dock-hyprland\nbind = SUPER, D, exec, wofi\n"),
+        )
+        .unwrap();
+        let generated_end = config
+            .find("exec-once")
+            .expect("extra configuration is present");
+        assert!(
+            config[..generated_end].contains("monitor = vvland, 1920x1080@30, 0x0, 1\n"),
+            "{config}"
+        );
+        assert!(
+            config.ends_with("bind = SUPER, D, exec, wofi\n"),
+            "{config}"
+        );
+    }
+
+    #[test]
     fn app_mode_gives_the_single_window_the_whole_output() {
         let config = hyprland_config(
             1280,
@@ -954,6 +994,7 @@ mod tests {
             false,
             None,
             "us",
+            None,
             None,
             None,
         )
@@ -972,11 +1013,11 @@ mod tests {
         // Hyprland reads a value to end of line: a newline would append a directive of the
         // caller's choosing, and `#` would truncate the value without a word of complaint.
         for hostile in ["us\nmonitor = , preferred", "us # comment", "us{", "us\r"] {
-            let error =
-                hyprland_config(640, 360, 30, None, true, None, hostile, None, None).unwrap_err();
+            let error = hyprland_config(640, 360, 30, None, true, None, hostile, None, None, None)
+                .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{hostile:?}");
         }
-        assert!(hyprland_config(640, 360, 30, None, true, None, "", None, None).is_err());
+        assert!(hyprland_config(640, 360, 30, None, true, None, "", None, None, None).is_err());
     }
 
     #[test]

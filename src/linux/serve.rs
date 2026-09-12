@@ -158,6 +158,9 @@ fn append_server_config(command: &mut Command, config: &Config) {
     if let Some(app) = &config.app {
         command.arg("--app").arg(app);
     }
+    if let Some(value) = &config.extra_config {
+        command.arg("--extra-config").arg(value);
+    }
     if let Some(value) = &config.drm_device {
         command.arg("--drm-device").arg(value);
     }
@@ -424,7 +427,26 @@ fn poll_readable(descriptor: RawFd, timeout: Duration) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
     use super::*;
+
+    #[test]
+    fn daemon_inherits_the_extra_configuration_path() {
+        // The daemon generates the compositor configuration itself, so a session started with
+        // --extra-config is only as configured as the argument it forwards.
+        let mut config = crate::cli::tests::parse(["vvland"]);
+        config.extra_config = Some(PathBuf::from("/home/user/dock.conf"));
+        let mut command = Command::new("true");
+        append_server_config(&mut command, &config);
+        let arguments: Vec<_> = command.get_args().collect();
+        let position = arguments
+            .iter()
+            .position(|argument| *argument == OsStr::new("--extra-config"))
+            .expect("--extra-config is forwarded");
+        assert_eq!(arguments[position + 1], OsStr::new("/home/user/dock.conf"));
+    }
 
     #[test]
     fn daemon_environment_scrubs_outer_session_and_vivid_values() {

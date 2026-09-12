@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use crate::cli::{Backend, Config, Renderer};
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_output, confirm_started, pipe, sanitize_child_environment,
-    set_client_environment, set_pulse_environment, socketpair, start_bounded_log, startup_error,
-    terminate_group, write_private_file, xwayland_enabled,
+    RuntimeDirectory, child_output, confirm_started, pipe, push_extra_config, read_extra_config,
+    sanitize_child_environment, set_client_environment, set_pulse_environment, socketpair,
+    start_bounded_log, startup_error, terminate_group, write_private_file, xwayland_enabled,
 };
 
 use super::CompositorEnvironment;
@@ -64,8 +64,18 @@ pub struct WestonSession {
 impl WestonSession {
     pub fn start(config: &Config, environment: CompositorEnvironment<'_>) -> io::Result<Self> {
         // Refuse before the backend and renderer retries, so the typed refusal is not laundered
-        // into a generic "failed with automatic renderer and Pixman" message (plan D12).
+        // into a generic "failed with automatic renderer and Pixman" message (plan D12). An
+        // unusable --extra-config is the same kind of refusal: the caller's file, not a renderer.
         weston_input_module()?;
+        let extra = match config.extra_config.as_deref() {
+            Some(path) => {
+                let extra = read_extra_config(path)?;
+                require_section_header(&extra)?;
+                Some(extra)
+            }
+            None => None,
+        };
+        let extra = extra.as_deref();
         let connector = config.drm_output.clone().or_else(|| {
             connected_drm_outputs(Path::new("/sys/class/drm"))
                 .into_iter()
@@ -77,19 +87,24 @@ impl WestonSession {
                 let connector = connector.ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "no connected DRM output")
                 })?;
-                Self::start_backend(config, &environment, ActiveBackend::Drm, connector)
+                Self::start_backend(config, &environment, ActiveBackend::Drm, connector, extra)
             }
             Backend::Headless => Self::start_backend(
                 config,
                 &environment,
                 ActiveBackend::Headless,
                 "headless".into(),
+                extra,
             ),
             Backend::Auto => {
                 if let Some(connector) = connector {
-                    if let Ok(session) =
-                        Self::start_backend(config, &environment, ActiveBackend::Drm, connector)
-                    {
+                    if let Ok(session) = Self::start_backend(
+                        config,
+                        &environment,
+                        ActiveBackend::Drm,
+                        connector,
+                        extra,
+                    ) {
                         return Ok(session);
                     }
                 }
@@ -98,6 +113,7 @@ impl WestonSession {
                     &environment,
                     ActiveBackend::Headless,
                     "headless".into(),
+                    extra,
                 )
             }
         }
@@ -113,6 +129,7 @@ impl WestonSession {
         environment: &CompositorEnvironment<'_>,
         backend: ActiveBackend,
         output_name: String,
+        extra: Option<&str>,
     ) -> io::Result<Self> {
         let first = match Self::start_once(
             config,
@@ -120,6 +137,7 @@ impl WestonSession {
             backend,
             output_name.clone(),
             config.renderer,
+            extra,
         ) {
             Ok(session) => return Ok(session),
             Err(error) => error,
@@ -127,12 +145,14 @@ impl WestonSession {
         let Some(fallback) = automatic_renderer_fallback(config.renderer) else {
             return Err(first);
         };
-        Self::start_once(config, environment, backend, output_name, fallback).map_err(|second| {
-            io::Error::other(format!(
-                "{} Weston failed with automatic renderer ({first}) and Pixman ({second})",
-                backend.name()
-            ))
-        })
+        Self::start_once(config, environment, backend, output_name, fallback, extra).map_err(
+            |second| {
+                io::Error::other(format!(
+                    "{} Weston failed with automatic renderer ({first}) and Pixman ({second})",
+                    backend.name()
+                ))
+            },
+        )
     }
 
     fn start_once(
@@ -141,6 +161,7 @@ impl WestonSession {
         backend: ActiveBackend,
         output_name: String,
         renderer: Renderer,
+        extra: Option<&str>,
     ) -> io::Result<Self> {
         // Fail before anything is created when this build has no input module (plan D12).
         let input_module = weston_input_module()?;
@@ -162,6 +183,7 @@ impl WestonSession {
             &config.xkb_layout,
             config.xkb_variant.as_deref(),
             config.xkb_options.as_deref(),
+            extra,
         );
         write_private_file(&config_path, generated.as_bytes(), 0o600)?;
 
@@ -426,6 +448,7 @@ fn weston_config(
     xkb_layout: &str,
     xkb_variant: Option<&str>,
     xkb_options: Option<&str>,
+    extra: Option<&str>,
 ) -> String {
     let pipewire_mode = format!("{width}x{height}@{fps}");
     // Single-app mode drops the shell panel so the one window owns the whole output. Weston
@@ -461,7 +484,29 @@ fn weston_config(
             config.push_str(&format!("[output]\nname=pipewire\nmode={pipewire_mode}\n"))
         }
     }
+    push_extra_config(&mut config, extra);
     config
+}
+
+/// Refuse extra configuration that would land inside the generated file's last section.
+///
+/// `weston.ini` is sectioned and the generated file ends inside `[output]`, so appended keys
+/// without a header of their own would silently reconfigure the captured output instead of
+/// whatever the author meant. Sway and Hyprland read flat directives and need no such rule.
+fn require_section_header(extra: &str) -> io::Result<()> {
+    let opens_a_section = extra
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .is_none_or(|line| line.starts_with('['));
+    if opens_a_section {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "--extra-config for Weston must open with its own [section] header; weston.ini keys \
+         otherwise join the generated [output] section",
+    ))
 }
 
 pub fn connected_drm_outputs(root: &Path) -> Vec<String> {
@@ -631,6 +676,45 @@ fn wait_for_wayland_socket(path: &Path, child: &mut Child, timeout: Duration) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_configuration_must_open_its_own_section() {
+        // weston.ini is sectioned and the generated file ends inside [output], so a bare key
+        // would reconfigure the captured output instead of doing what its author meant.
+        require_section_header("# a comment\n\n[autolaunch]\npath=/usr/bin/waybar\n")
+            .expect("a sectioned file is accepted");
+        require_section_header("").expect("an empty file changes nothing");
+        let error =
+            require_section_header("path=/usr/bin/waybar\n").expect_err("a bare key is refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn extra_configuration_follows_the_generated_sections() {
+        let config = weston_config(
+            ActiveBackend::Headless,
+            "pipewire",
+            1280,
+            720,
+            30,
+            Renderer::Auto,
+            false,
+            true,
+            None,
+            "us",
+            None,
+            None,
+            Some("[autolaunch]\npath=/usr/bin/waybar\n"),
+        );
+        assert!(
+            config.contains("[output]\nname=pipewire\nmode=1280x720@30\n"),
+            "{config}"
+        );
+        assert!(
+            config.ends_with("[autolaunch]\npath=/usr/bin/waybar\n"),
+            "{config}"
+        );
+    }
     use clap::Parser;
 
     /// D12: a Sway-only build must refuse the Weston backend with the documented message rather
@@ -737,6 +821,7 @@ mod tests {
             "us",
             None,
             None,
+            None,
         );
         assert!(config.contains("renderer=pixman"));
         assert!(config.contains("[pipewire]\nnum-outputs=1\n"));
@@ -764,6 +849,7 @@ mod tests {
             "us",
             None,
             None,
+            None,
         );
         assert!(config.contains("name=DP-4\nmode=preferred"));
         assert!(config.contains("name=pipewire\nmode=1920x1080@30\nmirror-of=DP-4"));
@@ -784,6 +870,7 @@ mod tests {
             "us",
             None,
             None,
+            None,
         );
         assert!(desktop.contains("panel-position=top"));
 
@@ -798,6 +885,7 @@ mod tests {
             false,
             None,
             "us",
+            None,
             None,
             None,
         );

@@ -115,6 +115,80 @@ pub fn write_private_file(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()
     file.flush()
 }
 
+/// The largest `--extra-config` file a session will splice into its generated configuration.
+///
+/// The text is held in memory, written into the private runtime directory, and parsed by the
+/// compositor, so it is bounded like every other caller-supplied input.
+pub const MAX_EXTRA_CONFIG_BYTES: u64 = 65_536;
+
+/// Read the `--extra-config` file that is appended to a generated compositor configuration.
+///
+/// The file is the session's escape hatch for directives vvland does not generate — `exec-once`
+/// for a dock or a status bar, extra binds, window rules — because the generated configuration is
+/// self-contained and the user's own `hyprland.conf` or `config` is never read. The bytes reach a
+/// line-oriented parser verbatim, so the size is bounded and the control characters that parser
+/// cannot carry are refused here rather than silently truncating a directive.
+pub fn read_extra_config(path: &Path) -> io::Result<String> {
+    let describe = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("--extra-config {}: {error}", path.display()),
+        )
+    };
+    let metadata = fs::metadata(path).map_err(describe)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("--extra-config {} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_EXTRA_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--extra-config {} is {} bytes; the limit is {MAX_EXTRA_CONFIG_BYTES}",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    let text = fs::read_to_string(path).map_err(describe)?;
+    if let Some(offending) = text
+        .chars()
+        .find(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "--extra-config {} contains {offending:?}, which a compositor configuration \
+                 cannot carry",
+                path.display()
+            ),
+        ));
+    }
+    Ok(text)
+}
+
+/// Append the user's extra configuration to a generated one, under a banner naming its origin.
+///
+/// It goes last deliberately: a compositor configuration resolves a repeated directive in favour
+/// of the later line, so the escape hatch can override what vvland generated. Overriding the
+/// output directives breaks capture, which is the user's call to make.
+pub fn push_extra_config(config: &mut String, extra: Option<&str>) {
+    let Some(extra) = extra else {
+        return;
+    };
+    if !config.ends_with('\n') {
+        config.push('\n');
+    }
+    config
+        .push_str("# --extra-config, appended verbatim; it overrides the generated lines above.\n");
+    config.push_str(extra);
+    if !extra.ends_with('\n') {
+        config.push('\n');
+    }
+}
+
 pub fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut descriptors = [-1; 2];
     // SAFETY: descriptors points to exactly two writable integers.
@@ -354,6 +428,49 @@ pub fn set_pulse_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_config_is_read_bounded_and_single_line_safe() {
+        let directory = RuntimeDirectory::create().expect("private runtime directory");
+        let path = directory.path.join("extra.conf");
+
+        fs::write(&path, "exec-once = nwg-dock-hyprland\n").expect("write extra config");
+        assert_eq!(
+            read_extra_config(&path).expect("readable extra config"),
+            "exec-once = nwg-dock-hyprland\n"
+        );
+
+        // A NUL or an escape sequence would be truncated or reinterpreted by the parser.
+        fs::write(&path, "exec-once = dock\u{1b}[2J\n").expect("write hostile extra config");
+        let error = read_extra_config(&path).expect_err("control characters are refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        fs::write(&path, vec![b'#'; MAX_EXTRA_CONFIG_BYTES as usize + 1]).expect("write oversize");
+        let error = read_extra_config(&path).expect_err("oversize files are refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error =
+            read_extra_config(&directory.path).expect_err("a directory is not a config file");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let error = read_extra_config(&directory.path.join("absent.conf"))
+            .expect_err("a missing file is reported, not ignored");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn extra_config_is_appended_last_and_newline_terminated() {
+        let mut config = "monitor = , disable\n".to_owned();
+        push_extra_config(&mut config, None);
+        assert_eq!(config, "monitor = , disable\n");
+
+        // The generated body stays intact and the extra directives follow it, so a repeated
+        // directive resolves in the caller's favour.
+        push_extra_config(&mut config, Some("exec-once = waybar"));
+        assert!(config.starts_with("monitor = , disable\n"), "{config}");
+        assert!(config.ends_with("exec-once = waybar\n"), "{config}");
+        assert!(config.contains("# --extra-config"), "{config}");
+    }
 
     #[test]
     fn child_environment_filter_excludes_credentials_and_host_display() {
