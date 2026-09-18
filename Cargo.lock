@@ -1159,6 +1159,9 @@ version = "1.5.8"
 dependencies = [
  "crossterm",
  "getrandom",
+ "log",
+ "serde",
+ "sha2",
  "vivid_protocol",
  "zeroize",
 ]
