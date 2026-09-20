@@ -41,7 +41,7 @@ session as a user whose desktop you would not hand over.
 
 See `docs/vvland/user-guide.md` for the full guide, including which applications work in
 single-app mode and why. The stable automation contract is
-`docs/vvland/control-protocol.md`; `docs/vvland-plan.md` records the consolidation of `veston` and
+`docs/vvland/control-protocol.md`; `archive/docs/vvland-plan.md` records the consolidation of `veston` and
 `vvsway`. Repeatable Chrome streaming checks and latency diagnostics are in
 `docs/vvland/performance.md`.
 
