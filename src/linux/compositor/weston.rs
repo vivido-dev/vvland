@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use crate::cli::{Backend, Config, Renderer};
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_output, confirm_started, pipe, push_extra_config, read_extra_config,
-    sanitize_child_environment, set_client_environment, set_pulse_environment, socketpair,
-    start_bounded_log, startup_error, terminate_group, write_private_file, xwayland_enabled,
+    BusEnvironment, RuntimeDirectory, SessionBus, child_output, confirm_started, pipe,
+    push_extra_config, read_extra_config, sanitize_child_environment, set_client_environment,
+    set_pulse_environment, socketpair, start_bounded_log, startup_error, terminate_group,
+    write_private_file, xwayland_enabled,
 };
 
 use super::CompositorEnvironment;
@@ -49,6 +50,8 @@ fn automatic_renderer_fallback(renderer: Renderer) -> Option<Renderer> {
 }
 
 pub struct WestonSession {
+    // Declared before `runtime` so the bus stops before its socket's directory is removed.
+    bus: SessionBus,
     runtime: RuntimeDirectory,
     child: Child,
     launched: Vec<Child>,
@@ -186,6 +189,13 @@ impl WestonSession {
             extra,
         );
         write_private_file(&config_path, generated.as_bytes(), 0o600)?;
+        let bus = SessionBus::start(BusEnvironment {
+            runtime: &runtime.path,
+            wayland_display: &wayland_display,
+            desktop: "weston",
+            pulse_server: environment.pulse_server,
+            pulse_sink: environment.pulse_sink,
+        })?;
 
         let (parent_fd, child_fd) = socketpair()?;
         let raw_child_fd = child_fd.as_raw_fd();
@@ -230,6 +240,7 @@ impl WestonSession {
         // Sanitize before the explicit routing below: the superset filter strips PULSE_* and the
         // host display, and a later `env` call must win over the removal.
         sanitize_child_environment(&mut command);
+        command.env("DBUS_SESSION_BUS_ADDRESS", bus.address());
         set_pulse_environment(
             &mut command,
             environment.pulse_server,
@@ -281,6 +292,7 @@ impl WestonSession {
         }
 
         Ok(Self {
+            bus,
             runtime,
             child,
             launched: Vec::new(),
@@ -322,6 +334,7 @@ impl WestonSession {
             &mut command,
             &self.runtime.path,
             &self.wayland_display,
+            self.bus.address(),
             self.pulse_server.as_deref(),
             self.pulse_sink.as_deref(),
         );
@@ -362,6 +375,7 @@ impl WestonSession {
             &mut command,
             &self.runtime.path,
             &self.wayland_display,
+            self.bus.address(),
             self.app_pulse_server(launch),
             self.pulse_sink.as_deref(),
         );
@@ -919,6 +933,7 @@ mod tests {
             &mut command,
             Path::new("/private/vvland"),
             "wayland-vvland",
+            OsStr::new("unix:path=/private/vvland/bus"),
             Some(OsStr::new("unix:/run/user/1000/pulse/native")),
             Some(OsStr::new("vvland_1234")),
         );
@@ -930,6 +945,10 @@ mod tests {
         assert!(environment.contains(&(
             OsStr::new("WAYLAND_DISPLAY"),
             Some(OsStr::new("wayland-vvland"))
+        )));
+        assert!(environment.contains(&(
+            OsStr::new("DBUS_SESSION_BUS_ADDRESS"),
+            Some(OsStr::new("unix:path=/private/vvland/bus"))
         )));
         assert!(environment.contains(&(
             OsStr::new("PULSE_SERVER"),

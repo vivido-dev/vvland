@@ -18,6 +18,7 @@ use super::audio::{AudioPipeline, PulseSink, idle_monitor_produces_data, resolve
 use super::compositor::{
     CompositorEnvironment, ResolvedCompositor, capture::ScreencopyCapture, hyprland, sway, weston,
 };
+use super::launcher::DBUS_DAEMON;
 use super::video::{CaptureSource, H264Encoder};
 
 pub fn run(config: &Config) -> io::Result<()> {
@@ -154,6 +155,17 @@ pub fn run(config: &Config) -> io::Result<()> {
         check_audio(config, &mut failures);
     } else {
         println!("  ok       audio explicitly disabled");
+    }
+
+    // Every session runs its own session bus, so a host without the daemon cannot start one.
+    match command_output(Path::new(DBUS_DAEMON), [OsStr::new("--version")]) {
+        Ok(version) => println!(
+            "  ok       {}",
+            version.lines().next().unwrap_or(DBUS_DAEMON)
+        ),
+        Err(error) => failures.push(format!(
+            "{DBUS_DAEMON} is unavailable, and every session runs its own session bus: {error}"
+        )),
     }
 
     let xwayland = command_output(Path::new("Xwayland"), [OsStr::new("-version")]).is_ok();

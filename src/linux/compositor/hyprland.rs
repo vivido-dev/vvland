@@ -27,9 +27,10 @@ use std::time::{Duration, Instant};
 use crate::cli::Config;
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_logs_enabled, child_output, confirm_started, pipe, push_extra_config,
-    read_extra_config, sanitize_child_environment, set_client_environment, set_pulse_environment,
-    start_bounded_log, startup_error, terminate_group, write_private_file, xwayland_enabled,
+    BusEnvironment, RuntimeDirectory, SessionBus, child_logs_enabled, child_output,
+    confirm_started, pipe, push_extra_config, read_extra_config, sanitize_child_environment,
+    set_client_environment, set_pulse_environment, start_bounded_log, startup_error,
+    terminate_group, write_private_file, xwayland_enabled,
 };
 
 use super::wlr_input::InputChannel;
@@ -69,6 +70,8 @@ const INSTANCE_PATH_BUDGET: usize = "/hypr/".len() + 62 + "/.socket2.sock".len()
 const MINIMUM_VERSION: (u32, u32) = (0, 53);
 
 pub struct HyprlandSession {
+    // Declared before `runtime` so the bus stops before its socket's directory is removed.
+    bus: SessionBus,
     runtime: RuntimeDirectory,
     child: Child,
     launched: Vec<Child>,
@@ -111,6 +114,14 @@ impl HyprlandSession {
         let wayland_socket = runtime.path.join(WAYLAND_DISPLAY);
         let listener = UnixListener::bind(&wayland_socket)?;
         let listener_fd = listener.as_raw_fd();
+        // Before the compositor, so an `exec-once` client finds the bus already listening.
+        let bus = SessionBus::start(BusEnvironment {
+            runtime: &runtime.path,
+            wayland_display: WAYLAND_DISPLAY,
+            desktop: "Hyprland",
+            pulse_server: environment.pulse_server,
+            pulse_sink: environment.pulse_sink,
+        })?;
 
         let (log_read, log_write) = pipe()?;
         let log_write_clone = log_write.try_clone()?;
@@ -131,6 +142,7 @@ impl HyprlandSession {
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "Hyprland")
             .env("XDG_SESSION_DESKTOP", "Hyprland")
+            .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
             // Hyprland otherwise pushes this session's WAYLAND_DISPLAY into the user's systemd
             // and D-Bus activation environments, where every later host process would inherit it.
             .env("HYPRLAND_NO_SD_VARS", "1")
@@ -207,6 +219,7 @@ impl HyprlandSession {
         };
 
         Ok(Self {
+            bus,
             runtime,
             child,
             launched: Vec::new(),
@@ -302,6 +315,7 @@ impl HyprlandSession {
             command,
             &self.runtime.path,
             WAYLAND_DISPLAY,
+            self.bus.address(),
             pulse_server,
             self.pulse_sink.as_deref(),
         );

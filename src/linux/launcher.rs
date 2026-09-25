@@ -5,11 +5,14 @@
 //! backends keep only what genuinely differs — readiness protocols, the launcher mechanism
 //! (Weston and Hyprland spawn directly, Sway execs through its IPC), and the input transport.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -397,19 +400,178 @@ pub fn confirm_started(name: &str, child: &mut Child) -> io::Result<()> {
     }
 }
 
-/// Point a launched client at one session: its private runtime directory, display, and Pulse
-/// routing. Shared because every direct-spawn backend needs exactly this set.
+/// Point a launched client at one session: its private runtime directory, display, session bus,
+/// and Pulse routing. Shared because every direct-spawn backend needs exactly this set.
 pub fn set_client_environment(
     command: &mut Command,
     runtime: &Path,
     wayland_display: &str,
+    bus_address: &OsStr,
     pulse_server: Option<&OsStr>,
     pulse_sink: Option<&OsStr>,
 ) {
     command
         .env("XDG_RUNTIME_DIR", runtime)
-        .env("WAYLAND_DISPLAY", wayland_display);
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env("DBUS_SESSION_BUS_ADDRESS", bus_address);
     set_pulse_environment(command, pulse_server, pulse_sink);
+}
+
+/// The D-Bus daemon every session runs, and the one a `--doctor` run looks for.
+pub const DBUS_DAEMON: &str = "dbus-daemon";
+/// The session bus socket, below the private runtime directory.
+const SESSION_BUS_SOCKET: &str = "bus";
+/// How long the session bus is given to accept connections.
+const SESSION_BUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the services a session bus activates need to know about the desktop they serve.
+pub struct BusEnvironment<'a> {
+    /// The session's private runtime directory, which also holds the bus socket.
+    pub runtime: &'a Path,
+    /// The display name, relative to `runtime`, clients of this desktop connect to.
+    pub wayland_display: &'a str,
+    /// `XDG_CURRENT_DESKTOP`, which selects the portal backend.
+    pub desktop: &'a str,
+    pub pulse_server: Option<&'a OsStr>,
+    pub pulse_sink: Option<&'a OsStr>,
+}
+
+/// A private D-Bus session bus for one desktop.
+///
+/// Inheriting the host's session bus sends a nested client's service activations to the host:
+/// the user's systemd starts `xdg-desktop-portal` with its own environment, which has no display
+/// on a host reached over SSH, so every GTK application waits out the portal's start timeout
+/// before it maps. A single-instance application also hands its launch to an instance already on
+/// the host bus, and the nested desktop gets no window. A bus of its own fixes both: the daemon
+/// runs no systemd activation, so it spawns services itself, and they inherit the environment set
+/// here — this session's runtime directory and display.
+///
+/// The daemon owns a process group, so teardown reaps the services it activated with it.
+pub struct SessionBus {
+    child: Child,
+    process_group: i32,
+    address: OsString,
+    log_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SessionBus {
+    pub fn start(environment: BusEnvironment<'_>) -> io::Result<Self> {
+        let socket = environment.runtime.join(SESSION_BUS_SOCKET);
+        let address = bus_address(&socket);
+        let (log_read, log_write) = pipe()?;
+        let log_write_clone = log_write.try_clone()?;
+        let mut listen = OsString::from("--address=");
+        listen.push(&address);
+        let mut command = Command::new(DBUS_DAEMON);
+        command
+            .args(["--session", "--nofork", "--nopidfile"])
+            .arg(listen)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_write_clone))
+            .stderr(Stdio::from(log_write));
+        sanitize_child_environment(&mut command);
+        command
+            .env("XDG_RUNTIME_DIR", environment.runtime)
+            .env("WAYLAND_DISPLAY", environment.wayland_display)
+            .env("DBUS_SESSION_BUS_ADDRESS", &address)
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env("XDG_CURRENT_DESKTOP", environment.desktop)
+            .env("XDG_SESSION_DESKTOP", environment.desktop);
+        set_pulse_environment(
+            &mut command,
+            environment.pulse_server,
+            environment.pulse_sink,
+        );
+        // SAFETY: setpgid is async-signal-safe and creates a group owned by this daemon.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not start the session's {DBUS_DAEMON}: {error}"),
+            )
+        })?;
+        // Release the log writers so a failure below does not wait on a reader that never ends.
+        drop(command);
+        let process_group = i32::try_from(child.id())
+            .map_err(|_| io::Error::other("dbus-daemon PID exceeds process-group range"))?;
+        let log_path = environment.runtime.join("dbus.log");
+        let log_thread = match start_bounded_log("vvland-dbus-log", log_read, log_path.clone()) {
+            Ok(thread) => thread,
+            Err(error) => {
+                terminate_group(process_group, &mut child);
+                return Err(error);
+            }
+        };
+        let mut bus = Self {
+            child,
+            process_group,
+            address,
+            log_thread: Some(log_thread),
+        };
+        if let Err(error) = bus.wait_ready(&socket) {
+            drop(bus);
+            return Err(startup_error(
+                format!("the session's {DBUS_DAEMON} did not become ready: {error}"),
+                DBUS_DAEMON,
+                &log_path,
+            ));
+        }
+        Ok(bus)
+    }
+
+    /// The `DBUS_SESSION_BUS_ADDRESS` of this bus.
+    pub fn address(&self) -> &OsStr {
+        &self.address
+    }
+
+    fn wait_ready(&mut self, socket: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + SESSION_BUS_TIMEOUT;
+        loop {
+            if UnixStream::connect(socket).is_ok() {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                return Err(io::Error::other(format!("it exited with {status}")));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "its socket accepted no connection",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for SessionBus {
+    fn drop(&mut self) {
+        terminate_group(self.process_group, &mut self.child);
+        if let Some(log_thread) = self.log_thread.take() {
+            let _ = log_thread.join();
+        }
+    }
+}
+
+/// A `unix:path=` D-Bus address, with every byte outside the address grammar's
+/// optionally-escaped set percent-encoded.
+fn bus_address(socket: &Path) -> OsString {
+    let mut address = String::from("unix:path=");
+    for &byte in socket.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_/.\\*".contains(&byte) {
+            address.push(char::from(byte));
+        } else {
+            address.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    OsString::from(address)
 }
 
 pub fn set_pulse_environment(
@@ -570,6 +732,184 @@ mod tests {
         assert!(confirm_started("google-chrome", &mut living).is_ok());
         let _ = living.kill();
         let _ = living.wait();
+    }
+
+    #[test]
+    fn bus_address_escapes_bytes_outside_the_address_grammar() {
+        assert_eq!(
+            bus_address(Path::new("/run/user/1000/vv83c7dd/bus")),
+            "unix:path=/run/user/1000/vv83c7dd/bus"
+        );
+        // `,` and `;` separate address parts and `=` keys from values; a space is not allowed.
+        assert_eq!(
+            bus_address(Path::new("/tmp/a b,c;d=e%/bus")),
+            "unix:path=/tmp/a%20b%2cc%3bd%3de%25/bus"
+        );
+    }
+
+    /// Start a bus whose activatable services include one, named after the session's runtime
+    /// directory, that records its environment.
+    ///
+    /// The service never claims its name, so the activation itself never completes; the record is
+    /// all the test needs. `XDG_DATA_DIRS` points the daemon's standard service directories at it.
+    fn bus_with_recording_service(data: &Path) -> (RuntimeDirectory, SessionBus) {
+        let runtime = RuntimeDirectory::create().unwrap();
+        // Written first: the daemon watches only the service directories present at startup.
+        let services = data.join("dbus-1/services");
+        fs::create_dir_all(&services).unwrap();
+        let name = runtime
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('-', "_");
+        fs::write(
+            services.join(format!("dev.vivido.{name}.service")),
+            format!(
+                "[D-BUS Service]\nName=dev.vivido.{name}\n\
+                 Exec=/bin/sh -c 'env > {}/activated-env; exec sleep 30'\n",
+                runtime.path.display()
+            ),
+        )
+        .unwrap();
+        let bus = SessionBus::start(BusEnvironment {
+            runtime: &runtime.path,
+            wayland_display: "wayland-vvland",
+            desktop: "Hyprland",
+            pulse_server: Some(OsStr::new("unix:/private/pulse")),
+            pulse_sink: None,
+        })
+        .unwrap();
+        (runtime, bus)
+    }
+
+    fn activate_recording_service(runtime: &RuntimeDirectory, bus: &SessionBus) {
+        let name = runtime
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .replace('-', "_");
+        let status = Command::new("dbus-send")
+            .arg(format!("--bus={}", bus.address().to_string_lossy()))
+            .args([
+                "--type=method_call",
+                "--dest=org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.StartServiceByName",
+                &format!("string:dev.vivido.{name}"),
+                "uint32:0",
+            ])
+            .status()
+            .expect("dbus-send is installed");
+        assert!(status.success());
+    }
+
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn session_bus_activates_services_into_this_desktop() {
+        let _guard = crate::cli::tests::TEST_ENV_LOCK.lock().unwrap();
+        let data = RuntimeDirectory::create().unwrap();
+        // SAFETY: test-only environment mutation, reverted below under the same lock.
+        unsafe {
+            std::env::set_var("XDG_DATA_DIRS", &data.path);
+            std::env::set_var("VIVID_ROOT_SECRET", "0123456789abcdef0123456789abcdef");
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-host");
+        }
+        let (runtime, bus) = bus_with_recording_service(&data.path);
+        // SAFETY: restoring the environment changed above.
+        unsafe {
+            std::env::remove_var("XDG_DATA_DIRS");
+            std::env::remove_var("VIVID_ROOT_SECRET");
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+
+        activate_recording_service(&runtime, &bus);
+        let recorded = wait_for_file(&runtime.path.join("activated-env"));
+        // Only the variables under test are ever reported: the rest of a service's environment is
+        // the invoking user's, and a failure message is no place for it.
+        let session_lines = recorded
+            .lines()
+            .filter(|line| {
+                ["XDG_", "WAYLAND_", "DBUS_", "PULSE_"]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .collect::<Vec<_>>();
+        // The service reaches this desktop's display and bus, not the host's.
+        let runtime_line = format!("XDG_RUNTIME_DIR={}", runtime.path.display());
+        for expected in [
+            runtime_line.as_str(),
+            "WAYLAND_DISPLAY=wayland-vvland",
+            "XDG_CURRENT_DESKTOP=Hyprland",
+            "PULSE_SERVER=unix:/private/pulse",
+        ] {
+            assert!(
+                session_lines.contains(&expected),
+                "{expected} missing from {session_lines:#?}"
+            );
+        }
+        // The daemon exports its own address, with the bus GUID appended.
+        let bus_prefix = format!(
+            "DBUS_SESSION_BUS_ADDRESS={},guid=",
+            bus.address().to_string_lossy()
+        );
+        assert!(
+            session_lines
+                .iter()
+                .any(|line| line.starts_with(&bus_prefix)),
+            "{bus_prefix} missing from {session_lines:#?}"
+        );
+        let leaked = recorded
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .filter(|name| name.starts_with("VIVID_"))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "session credentials reached an activated service: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_one_session_bus_leaves_another_intact() {
+        let _guard = crate::cli::tests::TEST_ENV_LOCK.lock().unwrap();
+        let data = RuntimeDirectory::create().unwrap();
+        // SAFETY: test-only environment mutation, reverted below under the same lock.
+        unsafe { std::env::set_var("XDG_DATA_DIRS", &data.path) };
+        // Both sessions use the same socket and display names inside their own directories.
+        let (first_runtime, first) = bus_with_recording_service(&data.path);
+        let (second_runtime, second) = bus_with_recording_service(&data.path);
+        // SAFETY: restoring the environment changed above.
+        unsafe { std::env::remove_var("XDG_DATA_DIRS") };
+
+        activate_recording_service(&first_runtime, &first);
+        wait_for_file(&first_runtime.path.join("activated-env"));
+        let first_group = first.process_group;
+        drop(first);
+
+        // The daemon and the service it activated went with it.
+        assert!(!process_group_exists(first_group));
+        // The other session's bus still accepts connections and activates services.
+        assert!(UnixStream::connect(second_runtime.path.join(SESSION_BUS_SOCKET)).is_ok());
+        activate_recording_service(&second_runtime, &second);
+        wait_for_file(&second_runtime.path.join("activated-env"));
     }
 
     #[test]

@@ -34,14 +34,6 @@ pub struct AppProfile {
     pub fullscreen: bool,
     /// Whether snap confinement needs the raw host `PULSE_SERVER` withheld.
     pub snap_aware: bool,
-    /// Whether the application needs its own D-Bus session bus.
-    ///
-    /// D-Bus single-instance applications hand a launch request to whichever instance already
-    /// owns their name on the bus. With the host's session bus inherited, that instance is on the
-    /// host's desktop: the nested compositor gets no window at all. A private bus also keeps the
-    /// nested session from talking to the host's services, which is the point of running it
-    /// isolated.
-    pub private_dbus: bool,
     /// The Wayland `app_id` used to target the window from the compositor config.
     pub app_id: &'static str,
 }
@@ -80,9 +72,6 @@ pub const PROFILES: &[AppProfile] = &[
         compositor: CompositorChoice::Sway,
         fullscreen: true,
         snap_aware: true,
-        // Chrome's single-instance check is keyed on its user-data directory rather than the
-        // session bus, and it reaches the nested compositor with the host bus inherited.
-        private_dbus: false,
         app_id: "google-chrome",
     },
     AppProfile {
@@ -93,7 +82,6 @@ pub const PROFILES: &[AppProfile] = &[
         compositor: CompositorChoice::Sway,
         fullscreen: true,
         snap_aware: false,
-        private_dbus: true,
         app_id: "thunar",
     },
 ];
@@ -126,7 +114,7 @@ pub fn known() -> String {
 /// A resolved launch: the argument vector and the environment the child needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppLaunch {
-    /// The full argv, including any private-bus wrapper.
+    /// The full argv.
     pub program: Vec<OsString>,
     /// The application binary itself, for diagnostics.
     pub binary: PathBuf,
@@ -137,9 +125,6 @@ pub struct AppLaunch {
     pub fullscreen: bool,
     pub app_id: &'static str,
 }
-
-/// The wrapper that gives a launched application its own D-Bus session bus.
-const PRIVATE_BUS_LAUNCHER: &str = "dbus-run-session";
 
 impl AppProfile {
     /// Build the launch for this profile, appending any `--` passthrough arguments.
@@ -159,27 +144,7 @@ impl AppProfile {
 
     /// The argv/env half of [`launch`], separated so it is testable without a real binary.
     pub fn launch_with(&self, binary: &Path, passthrough: &[OsString]) -> AppLaunch {
-        self.launch_parts(
-            binary,
-            passthrough,
-            self.private_dbus && private_bus_available(),
-        )
-    }
-
-    /// [`launch_with`] with the private-bus decision supplied, so it can be tested both ways.
-    fn launch_parts(
-        &self,
-        binary: &Path,
-        passthrough: &[OsString],
-        private_bus: bool,
-    ) -> AppLaunch {
-        let mut program = Vec::with_capacity(3 + self.args.len() + passthrough.len());
-        if private_bus {
-            // dbus-run-session starts a fresh bus and overrides DBUS_SESSION_BUS_ADDRESS for the
-            // command it runs, so nothing else has to unset the inherited one.
-            program.push(OsString::from(PRIVATE_BUS_LAUNCHER));
-            program.push(OsString::from("--"));
-        }
+        let mut program = Vec::with_capacity(1 + self.args.len() + passthrough.len());
         program.push(binary.as_os_str().to_owned());
         program.extend(self.args.iter().map(OsString::from));
         program.extend(passthrough.iter().cloned());
@@ -210,10 +175,6 @@ impl AppProfile {
                 .collect(),
         )
     }
-}
-
-fn private_bus_available() -> bool {
-    command_in_path(PRIVATE_BUS_LAUNCHER)
 }
 
 /// Pick the first non-snap candidate, falling back to the first candidate of any kind.
@@ -347,48 +308,17 @@ mod tests {
     }
 
     #[test]
-    fn a_dbus_single_instance_application_gets_its_own_bus() {
-        // Without this, Thunar hands the launch to whichever instance already owns its name on
-        // the inherited host bus and the nested compositor never sees a window.
-        let thunar = profile("thunar").unwrap();
-        assert!(thunar.private_dbus);
-        let wrapped = thunar.launch_parts(Path::new("/usr/bin/thunar"), &[], true);
-        assert_eq!(
-            wrapped.program,
-            ["dbus-run-session", "--", "/usr/bin/thunar"].map(OsString::from)
-        );
-        // The application binary stays reportable for diagnostics.
-        assert_eq!(wrapped.binary, Path::new("/usr/bin/thunar"));
-
-        // Without the wrapper available the application is still launched, just on the host bus.
-        let bare = thunar.launch_parts(Path::new("/usr/bin/thunar"), &[], false);
-        assert_eq!(bare.program, ["/usr/bin/thunar"].map(OsString::from));
-
-        // Chrome does not need one, so it is never wrapped.
-        let chrome = profile("google-chrome").unwrap();
-        assert!(!chrome.private_dbus);
-        assert_eq!(
-            chrome
-                .launch_with(Path::new("/usr/bin/google-chrome"), &[])
-                .program
-                .first()
-                .unwrap(),
-            &OsString::from("/usr/bin/google-chrome")
-        );
-    }
-
-    #[test]
-    fn the_private_bus_wrapper_precedes_profile_and_passthrough_arguments() {
-        let thunar = profile("thunar").unwrap();
-        let launch = thunar.launch_parts(
-            Path::new("/usr/bin/thunar"),
-            &[OsString::from("/tmp")],
-            true,
-        );
+    fn profile_arguments_precede_passthrough_arguments() {
+        // The session's own bus already isolates a single-instance application such as Thunar,
+        // so the binary runs directly, with no bus wrapper in front of it.
+        let launch = profile("thunar")
+            .unwrap()
+            .launch_with(Path::new("/usr/bin/thunar"), &[OsString::from("/tmp")]);
         assert_eq!(
             launch.program,
-            ["dbus-run-session", "--", "/usr/bin/thunar", "/tmp"].map(OsString::from)
+            ["/usr/bin/thunar", "/tmp"].map(OsString::from)
         );
+        assert_eq!(launch.binary, Path::new("/usr/bin/thunar"));
     }
 
     #[test]

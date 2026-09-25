@@ -13,15 +13,21 @@ use std::time::{Duration, Instant};
 use crate::cli::{Config, Renderer};
 use crate::linux::app::{AppLaunch, is_unix_pulse_server};
 use crate::linux::launcher::{
-    RuntimeDirectory, child_logs_enabled, pipe, push_extra_config, read_extra_config,
-    sanitize_child_environment, start_bounded_log, startup_error, terminate_group,
-    write_private_file, xwayland_enabled,
+    BusEnvironment, RuntimeDirectory, SessionBus, child_logs_enabled, pipe, push_extra_config,
+    read_extra_config, sanitize_child_environment, start_bounded_log, startup_error,
+    terminate_group, write_private_file, xwayland_enabled,
 };
 
 use super::wlr_input::InputChannel;
 use super::{AppWindow, CompositorEnvironment, CompositorWindow, WindowRect};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
+/// The display name the session bus hands to the services it activates.
+///
+/// Sway picks its own `wayland-N` and takes no socket to listen on, but the bus has to start
+/// first so a configuration `exec` finds it; the services are therefore given this fixed name,
+/// linked to Sway's socket once it exists.
+const BUS_WAYLAND_DISPLAY: &str = "wayland-vvland";
 const MAX_LAUNCHERS: u32 = 4096;
 const MAX_LAUNCHER_BYTES: usize = 65_536;
 const SWAY_IPC_MAGIC: &[u8; 6] = b"i3-ipc";
@@ -40,6 +46,9 @@ fn automatic_renderer_fallback(renderer: Renderer) -> Option<Renderer> {
 }
 
 pub struct SwaySession {
+    // Held for its lifetime; Sway's clients inherit its address from Sway's environment.
+    // Declared before `runtime` so the bus stops before its socket's directory is removed.
+    _bus: SessionBus,
     runtime: RuntimeDirectory,
     child: Child,
     pulse_server: Option<OsString>,
@@ -97,6 +106,16 @@ impl SwaySession {
             extra,
         );
         write_private_file(&config_path, generated.as_bytes(), 0o600)?;
+        let pulse_server = environment
+            .pulse_server
+            .unwrap_or_else(|| OsStr::new("unix:/dev/null"));
+        let bus = SessionBus::start(BusEnvironment {
+            runtime: &runtime.path,
+            wayland_display: BUS_WAYLAND_DISPLAY,
+            desktop: "sway",
+            pulse_server: Some(pulse_server),
+            pulse_sink: environment.pulse_sink,
+        })?;
 
         let (log_read, log_write) = pipe()?;
         let log_write_clone = log_write.try_clone()?;
@@ -114,6 +133,7 @@ impl SwaySession {
             .env("XDG_SESSION_TYPE", "wayland")
             .env("XDG_CURRENT_DESKTOP", "sway")
             .env("XDG_SESSION_DESKTOP", "sway")
+            .env("DBUS_SESSION_BUS_ADDRESS", bus.address())
             .env("WLR_BACKENDS", "headless")
             .env("WLR_HEADLESS_OUTPUTS", "1")
             .env("WLR_LIBINPUT_NO_DEVICES", "1");
@@ -150,6 +170,10 @@ impl SwaySession {
         };
 
         let sockets = wait_for_sockets(&runtime.path, child.id(), &mut child, READY_TIMEOUT);
+        let sockets = sockets.and_then(|(wayland, sway)| {
+            link_bus_display(&runtime.path, &wayland)?;
+            Ok((wayland, sway))
+        });
         let (wayland_socket, sway_socket) = match sockets {
             Ok(sockets) => sockets,
             Err(error) => {
@@ -177,6 +201,7 @@ impl SwaySession {
         };
 
         Ok(Self {
+            _bus: bus,
             runtime,
             child,
             pulse_server: environment.pulse_server.map(OsStr::to_owned),
@@ -689,6 +714,14 @@ fn required_u32(node: &serde_json::Map<String, serde_json::Value>, key: &str) ->
 
 fn invalid_tree(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Give the bus's services Sway's display under the name they were started with.
+fn link_bus_display(runtime: &Path, wayland_socket: &Path) -> io::Result<()> {
+    let target = wayland_socket
+        .file_name()
+        .ok_or_else(|| io::Error::other("Sway's Wayland socket has no file name"))?;
+    std::os::unix::fs::symlink(target, runtime.join(BUS_WAYLAND_DISPLAY))
 }
 
 fn wait_for_sockets(
