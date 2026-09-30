@@ -1,0 +1,12 @@
+[package]
+name = "vvsway"
+version = "0.1.1"
+authors = ["Wensheng Wang <wenshengwang@gmail.com>"]
+edition = "2024"
+rust-version = "1.85.0"
+description = "Deprecated: use vvland --compositor sway. Thin wrapper kept for old command lines"
+repository = "https://github.com/vivido-dev/vvland"
+license = "Apache-2.0"
+
+[dependencies]
+vvland = { version = "0.1", path = ".." }
