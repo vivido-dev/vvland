@@ -1227,7 +1227,9 @@ mod tests {
             u16::from(pipeline.spec.channels),
         )
         .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // libpulse can stall several seconds on a stale X11 forward (an unreachable $DISPLAY)
+        // before it reports the missing server, so only the eventual close is asserted.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match pipeline.queue.pop(Duration::from_millis(20)) {
                 Err(_) => break,
@@ -1427,6 +1429,7 @@ esac
         )
         .unwrap();
         let sinks = Command::new("pactl")
+            .env_remove("DISPLAY")
             .arg("--server")
             .arg(sink.server())
             .args(["list", "sinks", "short"])
@@ -1466,6 +1469,9 @@ esac
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("PULSE_SERVER", sink.server())
             .env("PULSE_SINK", sink.sink_name())
+            // A stale forwarded $DISPLAY makes libpulse stall for seconds before it connects, here
+            // and in the `pactl` polls below, which would outlast the 2 s tone.
+            .env_remove("DISPLAY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1474,6 +1480,7 @@ esac
         let deadline = Instant::now() + Duration::from_secs(1);
         let attached = loop {
             let inputs = Command::new("pactl")
+                .env_remove("DISPLAY")
                 .arg("--server")
                 .arg(sink.server())
                 .args(["list", "sink-inputs", "short"])

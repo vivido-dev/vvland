@@ -67,6 +67,9 @@ pub const PROFILES: &[AppProfile] = &[
             "--disable-component-update",
             "--disable-background-networking",
             "--disable-sync",
+            // Without this Chrome asks the Secret Service to unlock a keyring, which pops a
+            // gcr-prompter window into a session that must show exactly one.
+            "--password-store=basic",
             "--disable-features=PassageEmbeddings,HistoryEmbeddings,OptimizationGuideModelDownloading",
         ],
         compositor: CompositorChoice::Sway,
@@ -285,6 +288,7 @@ mod tests {
                 "--disable-component-update",
                 "--disable-background-networking",
                 "--disable-sync",
+                "--password-store=basic",
                 "--disable-features=PassageEmbeddings,HistoryEmbeddings,OptimizationGuideModelDownloading",
                 "--user-data-dir=/tmp/x",
             ]
