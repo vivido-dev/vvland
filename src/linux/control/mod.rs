@@ -79,7 +79,7 @@ impl EventSink {
         }
         if self
             .queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < MAX_SUBSCRIBER_EVENTS).then_some(queued + 1)
             })
             .is_err()

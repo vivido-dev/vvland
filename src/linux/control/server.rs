@@ -86,7 +86,7 @@ fn accept_loop(
         match listener.accept() {
             Ok((stream, _)) => {
                 if connections
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                         (current < MAX_CONNECTIONS).then_some(current + 1)
                     })
                     .is_err()
