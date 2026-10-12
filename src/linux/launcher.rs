@@ -808,10 +808,10 @@ mod tests {
     fn wait_for_file(path: &Path) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(text) = fs::read_to_string(path) {
-                if !text.is_empty() {
-                    return text;
-                }
+            if let Ok(text) = fs::read_to_string(path)
+                && !text.is_empty()
+            {
+                return text;
             }
             assert!(
                 Instant::now() < deadline,

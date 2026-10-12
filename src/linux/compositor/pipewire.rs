@@ -853,7 +853,9 @@ mod tests {
                 buffered_us = frame.pts_us.saturating_sub(first_pts_us);
                 visible |= frame
                     .data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|pixel| pixel[..3] != [0, 0, 0]);
                 if visible && buffered_us >= 100_000 {
                     break;

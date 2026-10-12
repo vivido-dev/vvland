@@ -474,10 +474,9 @@ impl AudioPipeline {
             .spawn(move || {
                 if let Err(error) =
                     capture_thread(&monitor, &server, &capture_buffer, &capture_stop)
+                    && !capture_stop.load(Ordering::Acquire)
                 {
-                    if !capture_stop.load(Ordering::Acquire) {
-                        capture_buffer.close(error.to_string());
-                    }
+                    capture_buffer.close(error.to_string());
                 }
             })?;
 
@@ -714,12 +713,12 @@ fn encode_paced_frame(
     );
     frame.set_rate(AUDIO_RATE);
     frame.set_pts(Some(paced.pts_samples));
-    for (output, samples) in frame
+    for (output, &[left, right]) in frame
         .plane_mut::<(f32, f32)>(0)
         .iter_mut()
-        .zip(paced.samples.chunks_exact(2))
+        .zip(paced.samples.as_chunks::<2>().0)
     {
-        *output = (samples[0], samples[1]);
+        *output = (left, right);
     }
     encoder.send_frame(&frame).map_err(ffmpeg_error)?;
     receive_opus(encoder, base_pts_us, queue)

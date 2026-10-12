@@ -432,18 +432,16 @@ fn run_desktop(
             terminal,
             gain,
         )?;
-        if ready {
-            if let Some((track, _)) = &audio_pair {
-                ready = super::terminal::wait_for_milestone(
-                    desktop.session_mut(),
-                    track,
-                    SLOT_MILESTONE,
-                    "waiting for the presenter to decode audio | C-b q quits",
-                    leader,
-                    terminal,
-                    gain,
-                )?;
-            }
+        if ready && let Some((track, _)) = &audio_pair {
+            ready = super::terminal::wait_for_milestone(
+                desktop.session_mut(),
+                track,
+                SLOT_MILESTONE,
+                "waiting for the presenter to decode audio | C-b q quits",
+                leader,
+                terminal,
+                gain,
+            )?;
         }
         if ready {
             let mut slots = SurfaceSlots::new(desktop.desktop_surface().inner());
@@ -714,18 +712,16 @@ fn run_terminal(
             terminal,
             gain,
         )?;
-        if ready {
-            if let Some(track) = &audio_track {
-                ready = super::terminal::wait_for_milestone(
-                    &mut session,
-                    track,
-                    SLOT_MILESTONE,
-                    "waiting for the presenter to decode audio | C-b q quits",
-                    leader,
-                    terminal,
-                    gain,
-                )?;
-            }
+        if ready && let Some(track) = &audio_track {
+            ready = super::terminal::wait_for_milestone(
+                &mut session,
+                track,
+                SLOT_MILESTONE,
+                "waiting for the presenter to decode audio | C-b q quits",
+                leader,
+                terminal,
+                gain,
+            )?;
         }
         if ready {
             let mut slots = SurfaceSlots::new(&surface);
@@ -789,10 +785,10 @@ fn run_terminal(
         let _ = session.destroy_surface(&surface, &RequestMetadata::default());
     }
     // The recovery closure was dropped when its worker joined, so the session is ours again.
-    if let Ok(mutex) = Arc::try_unwrap(session) {
-        if let Ok(session) = mutex.into_inner() {
-            let _ = session.close();
-        }
+    if let Ok(mutex) = Arc::try_unwrap(session)
+        && let Ok(session) = mutex.into_inner()
+    {
+        let _ = session.close();
     }
     drop(terminal);
     if let Some(reason) = audio_runtime.disabled_reason() {

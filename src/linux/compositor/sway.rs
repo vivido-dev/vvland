@@ -273,12 +273,11 @@ impl SwaySession {
         }
         // A snap-confined browser runs behind snap's own Pulse mediation; a raw host unix socket
         // can drop it to ALSA, while PULSE_SINK alone still selects the private sink.
-        if launch.snap_confined {
-            if let Some(server) = &self.pulse_server {
-                if is_unix_pulse_server(server) {
-                    script.extend_from_slice(b"unset PULSE_SERVER\n");
-                }
-            }
+        if launch.snap_confined
+            && let Some(server) = &self.pulse_server
+            && is_unix_pulse_server(server)
+        {
+            script.extend_from_slice(b"unset PULSE_SERVER\n");
         }
         if !child_logs_enabled() {
             script.extend_from_slice(b"exec >/dev/null 2>&1\n");

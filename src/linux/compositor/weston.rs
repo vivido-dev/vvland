@@ -100,16 +100,16 @@ impl WestonSession {
                 extra,
             ),
             Backend::Auto => {
-                if let Some(connector) = connector {
-                    if let Ok(session) = Self::start_backend(
+                if let Some(connector) = connector
+                    && let Ok(session) = Self::start_backend(
                         config,
                         &environment,
                         ActiveBackend::Drm,
                         connector,
                         extra,
-                    ) {
-                        return Ok(session);
-                    }
+                    )
+                {
+                    return Ok(session);
                 }
                 Self::start_backend(
                     config,

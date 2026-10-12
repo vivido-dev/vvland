@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "vivid_sdk"
-version = "1.5.10"
+version = "1.5.11"
 dependencies = [
  "getrandom",
  "log",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "vvreceive"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cap-std",
  "getrandom",

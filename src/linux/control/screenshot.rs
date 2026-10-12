@@ -214,7 +214,7 @@ mod tests {
 
     fn source(format: crate::linux::video::RawPixelFormat) -> RawFrame {
         let mut data = vec![0_u8; 64 * 64 * 4];
-        for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = u8::try_from(index % 64).unwrap();
             let y = u8::try_from(index / 64).unwrap();
             match format {

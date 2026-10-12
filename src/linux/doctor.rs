@@ -448,31 +448,28 @@ fn check_drm(config: &Config, failures: &mut Vec<String>) {
     if device_available
         && config.backend != Backend::Headless
         && config.renderer != Renderer::Pixman
+        && let Some(render_node) = weston::drm_render_node(drm_sys_root, drm_dev_root, &device)
     {
-        if let Some(render_node) = weston::drm_render_node(drm_sys_root, drm_dev_root, &device) {
-            match OpenOptions::new().read(true).write(true).open(&render_node) {
-                Ok(_) => println!(
-                    "  ok       GPU render node can be opened: {}",
-                    render_node.display()
-                ),
-                Err(error)
-                    if config.backend == Backend::Drm && config.renderer != Renderer::Auto =>
-                {
-                    failures.push(format!(
-                        "cannot open GPU render node {} read/write for {} renderer: {error}",
-                        render_node.display(),
-                        config.renderer.as_weston()
-                    ));
-                }
-                Err(error) if config.renderer == Renderer::Auto => println!(
-                    "  warning  GPU render node {} is unavailable ({error}); automatic renderer will retry Pixman",
-                    render_node.display()
-                ),
-                Err(error) => println!(
-                    "  warning  GPU render node {} is unavailable ({error}); auto backend may use headless",
-                    render_node.display()
-                ),
+        match OpenOptions::new().read(true).write(true).open(&render_node) {
+            Ok(_) => println!(
+                "  ok       GPU render node can be opened: {}",
+                render_node.display()
+            ),
+            Err(error) if config.backend == Backend::Drm && config.renderer != Renderer::Auto => {
+                failures.push(format!(
+                    "cannot open GPU render node {} read/write for {} renderer: {error}",
+                    render_node.display(),
+                    config.renderer.as_weston()
+                ));
             }
+            Err(error) if config.renderer == Renderer::Auto => println!(
+                "  warning  GPU render node {} is unavailable ({error}); automatic renderer will retry Pixman",
+                render_node.display()
+            ),
+            Err(error) => println!(
+                "  warning  GPU render node {} is unavailable ({error}); auto backend may use headless",
+                render_node.display()
+            ),
         }
     }
 }

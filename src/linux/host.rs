@@ -498,14 +498,13 @@ fn initial_size(
             .into_iter()
             .next()
     });
-    if let Some(output) = output {
-        if let Some((width, height)) =
+    if let Some(output) = output
+        && let Some((width, height)) =
             drm_native_mode(std::path::Path::new("/sys/class/drm"), &output)
-        {
-            let dimensions = (width & !1, height & !1);
-            if dimensions.0 >= 64 && dimensions.1 >= 64 {
-                return Ok((config.clone(), dimensions));
-            }
+    {
+        let dimensions = (width & !1, height & !1);
+        if dimensions.0 >= 64 && dimensions.1 >= 64 {
+            return Ok((config.clone(), dimensions));
         }
     }
     if config.backend == Backend::Drm {

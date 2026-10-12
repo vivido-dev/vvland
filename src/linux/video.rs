@@ -252,7 +252,7 @@ impl H264Encoder {
                 "H.264 frame rate must be between 1 and 240",
             ));
         }
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "H.264 YUV420P dimensions must be even",
