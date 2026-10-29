@@ -97,6 +97,12 @@ pub fn apply(
                 )?;
             }
         }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "desktop input event kind is not supported",
+            ));
+        }
     }
     Ok(())
 }
