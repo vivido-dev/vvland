@@ -541,13 +541,13 @@ fn create_opus_source() -> io::Result<(ffmpeg::encoder::Audio, AudioTrackSpec)> 
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid Opus pre-skip"))?
     };
     let extradata = opus_head(pre_skip);
-    media::validate_audio_initialization(
-        "opus",
-        AUDIO_PACKETIZATION_OPUS,
-        &extradata,
-        AUDIO_RATE,
-        AUDIO_CHANNELS,
-    )?;
+    media::validate_audio_initialization(vivid_protocol::media::AudioInitialization {
+        codec: "opus",
+        packetization: AUDIO_PACKETIZATION_OPUS,
+        extradata: &extradata,
+        sample_rate: AUDIO_RATE,
+        channels: AUDIO_CHANNELS,
+    })?;
     let spec = AudioTrackSpec {
         extradata,
         sample_rate: AUDIO_RATE,
@@ -1218,13 +1218,13 @@ mod tests {
             &test_identity(),
         )
         .unwrap();
-        media::validate_audio_initialization(
-            "opus",
-            AUDIO_PACKETIZATION_OPUS,
-            &pipeline.spec.extradata,
-            pipeline.spec.sample_rate,
-            u16::from(pipeline.spec.channels),
-        )
+        media::validate_audio_initialization(vivid_protocol::media::AudioInitialization {
+            codec: "opus",
+            packetization: AUDIO_PACKETIZATION_OPUS,
+            extradata: &pipeline.spec.extradata,
+            sample_rate: pipeline.spec.sample_rate,
+            channels: u16::from(pipeline.spec.channels),
+        })
         .unwrap();
         // libpulse can stall several seconds on a stale X11 forward (an unreachable $DISPLAY)
         // before it reports the missing server, so only the eventual close is asserted.
@@ -1331,13 +1331,13 @@ esac
     #[test]
     fn generated_opus_head_is_canonical() {
         let head = opus_head(312);
-        media::validate_audio_initialization(
-            "opus",
-            AUDIO_PACKETIZATION_OPUS,
-            &head,
-            AUDIO_RATE,
-            AUDIO_CHANNELS,
-        )
+        media::validate_audio_initialization(vivid_protocol::media::AudioInitialization {
+            codec: "opus",
+            packetization: AUDIO_PACKETIZATION_OPUS,
+            extradata: &head,
+            sample_rate: AUDIO_RATE,
+            channels: AUDIO_CHANNELS,
+        })
         .unwrap();
     }
 
